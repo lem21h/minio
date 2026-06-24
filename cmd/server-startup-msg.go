@@ -152,11 +152,12 @@ func printLambdaTargets() {
 		return
 	}
 
-	arnMsg := color.Blue("Object Lambda ARNs: ")
+	var arnMsg strings.Builder
+	arnMsg.WriteString(color.Blue("Object Lambda ARNs: "))
 	for _, arn := range globalLambdaTargetList.List(globalSite.Region()) {
-		arnMsg += color.Bold(fmt.Sprintf("%s ", arn))
+		arnMsg.WriteString(color.Bold(fmt.Sprintf("%s ", arn)))
 	}
-	logger.Startup(arnMsg + "\n")
+	logger.Startup(arnMsg.String() + "\n")
 }
 
 // Prints bucket notification configurations.

@@ -267,19 +267,29 @@ func (sys *NotificationSys) LoadServiceAccount(ctx context.Context, accessKey st
 func (sys *NotificationSys) BackgroundHealStatus(ctx context.Context) ([]madmin.BgHealState, []NotificationPeerErr) {
 	ng := WithNPeers(len(sys.peerClients))
 	states := make([]madmin.BgHealState, len(sys.peerClients))
+
 	for idx, client := range sys.peerClients {
+		idx := idx
 		client := client
+
+		var host xnet.Host
+		if client != nil && client.host != nil {
+			host = *client.host
+		}
+
 		ng.Go(ctx, func() error {
-			if client == nil {
+			if client == nil || client.host == nil {
 				return errPeerNotReachable
 			}
+
 			st, err := client.BackgroundHealStatus(ctx)
 			if err != nil {
 				return err
 			}
+
 			states[idx] = st
 			return nil
-		}, idx, *client.host)
+		}, idx, host)
 	}
 
 	return states, ng.Wait()
@@ -475,28 +485,48 @@ var errPeerNotReachable = errors.New("peer is not reachable")
 func (sys *NotificationSys) GetLocks(ctx context.Context, r *http.Request) []*PeerLocks {
 	locksResp := make([]*PeerLocks, len(sys.peerClients))
 	g := errgroup.WithNErrs(len(sys.peerClients))
+
 	for index, client := range sys.peerClients {
+		index := index
 		client := client
+
+		peerAddr := ""
+		if client != nil && client.host != nil {
+			peerAddr = client.host.String()
+		}
+
 		g.Go(func() error {
 			if client == nil {
 				return errPeerNotReachable
 			}
-			serverLocksResp, err := sys.peerClients[index].GetLocks(ctx)
+
+			serverLocksResp, err := client.GetLocks(ctx)
 			if err != nil {
 				return err
 			}
 			locksResp[index] = &PeerLocks{
-				Addr:  sys.peerClients[index].host.String(),
+				Addr:  peerAddr,
 				Locks: serverLocksResp,
 			}
 			return nil
 		}, index)
 	}
 	for index, err := range g.Wait() {
-		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress",
-			sys.peerClients[index].host.String())
+		if err == nil {
+			continue
+		}
+
+		client := sys.peerClients[index]
+
+		peerAddr := ""
+		if client != nil && client.host != nil {
+			peerAddr = client.host.String()
+		}
+
+		reqInfo := (&logger.ReqInfo{}).AppendTags("peerAddress", peerAddr)
 		ctx := logger.SetReqInfo(ctx, reqInfo)
-		peersLogOnceIf(ctx, err, sys.peerClients[index].host.String())
+
+		peersLogOnceIf(ctx, err, peerAddr)
 	}
 	locksResp = append(locksResp, &PeerLocks{
 		Addr:  getHostName(r),

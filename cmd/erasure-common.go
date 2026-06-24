@@ -26,17 +26,21 @@ import (
 
 func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
 	disks := er.getDisks()
+
 	var wg sync.WaitGroup
 	var mu sync.Mutex
+	newDisks = make([]StorageAPI, 0, len(disks))
+
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
+
 	for _, i := range r.Perm(len(disks)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			if disks[i] == nil {
-				return
-			}
-			di, err := disks[i].DiskInfo(context.Background(), DiskInfoOptions{})
+		disk := disks[i] // avoids repeated indexing
+		if disk == nil {
+			// avoids spawning goroutines that immediately return
+			continue
+		}
+		wg.Go(func() {
+			di, err := disk.DiskInfo(context.Background(), DiskInfoOptions{})
 			if err != nil || di.Healing {
 				// - Do not consume disks which are not reachable
 				//   unformatted or simply not accessible for some reason.
@@ -48,10 +52,11 @@ func (er erasureObjects) getOnlineDisks() (newDisks []StorageAPI) {
 			}
 
 			mu.Lock()
-			newDisks = append(newDisks, disks[i])
+			newDisks = append(newDisks, disk)
 			mu.Unlock()
-		}()
+		})
 	}
+
 	wg.Wait()
 	return newDisks
 }

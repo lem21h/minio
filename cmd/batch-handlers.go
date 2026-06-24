@@ -1771,22 +1771,22 @@ func (a adminAPIHandlers) StartBatchJob(w http.ResponseWriter, r *http.Request) 
 	// Fill with default values
 	if job.Replicate != nil {
 		if job.Replicate.Source.Snowball.Disable == nil {
-			job.Replicate.Source.Snowball.Disable = ptr(false)
+			job.Replicate.Source.Snowball.Disable = new(false)
 		}
 		if job.Replicate.Source.Snowball.Batch == nil {
-			job.Replicate.Source.Snowball.Batch = ptr(100)
+			job.Replicate.Source.Snowball.Batch = new(100)
 		}
 		if job.Replicate.Source.Snowball.InMemory == nil {
-			job.Replicate.Source.Snowball.InMemory = ptr(true)
+			job.Replicate.Source.Snowball.InMemory = new(true)
 		}
 		if job.Replicate.Source.Snowball.Compress == nil {
-			job.Replicate.Source.Snowball.Compress = ptr(false)
+			job.Replicate.Source.Snowball.Compress = new(false)
 		}
 		if job.Replicate.Source.Snowball.SmallerThan == nil {
-			job.Replicate.Source.Snowball.SmallerThan = ptr("5MiB")
+			job.Replicate.Source.Snowball.SmallerThan = new("5MiB")
 		}
 		if job.Replicate.Source.Snowball.SkipErrs == nil {
-			job.Replicate.Source.Snowball.SkipErrs = ptr(true)
+			job.Replicate.Source.Snowball.SkipErrs = new(true)
 		}
 	}
 

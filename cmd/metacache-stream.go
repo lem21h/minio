@@ -769,8 +769,14 @@ type metacacheBlockWriter struct {
 // Each block is the size of the capacity of the input channel.
 // The caller should close to indicate the stream has ended.
 func newMetacacheBlockWriter(in <-chan metaCacheEntry, nextBlock func(b *metacacheBlock) error) *metacacheBlockWriter {
+	blockEntries := cap(in)
+	if blockEntries <= 0 {
+		blockEntries = 1
+	}
+
 	w := metacacheBlockWriter{blockEntries: cap(in)}
 	w.wg.Add(1)
+	//TODO: this looks messy
 	go func() {
 		defer w.wg.Done()
 		var current metacacheBlock
@@ -784,6 +790,7 @@ func newMetacacheBlockWriter(in <-chan metaCacheEntry, nextBlock func(b *metacac
 
 		block := newMetacacheWriter(buf, 1<<20)
 		defer block.Close()
+
 		finishBlock := func() {
 			if err := block.Close(); err != nil {
 				w.streamErr = err

@@ -26,7 +26,7 @@ const _lcEventSrc_name = "NoneHealScannerDecomRebals3HeadObjects3GetObjects3List
 var _lcEventSrc_index = [...]uint8{0, 4, 8, 15, 20, 25, 37, 48, 61, 72, 84, 109}
 
 func (i lcEventSrc) String() string {
-	if i >= lcEventSrc(len(_lcEventSrc_index)-1) {
+	if i < 0 || i >= lcEventSrc(len(_lcEventSrc_index)-1) {
 		return "lcEventSrc(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
 	return _lcEventSrc_name[_lcEventSrc_index[i]:_lcEventSrc_index[i+1]]

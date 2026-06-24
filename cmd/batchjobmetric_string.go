@@ -18,7 +18,7 @@ const _batchJobMetric_name = "ReplicationKeyRotationExpire"
 var _batchJobMetric_index = [...]uint8{0, 11, 22, 28}
 
 func (i batchJobMetric) String() string {
-	if i >= batchJobMetric(len(_batchJobMetric_index)-1) {
+	if i < 0 || i >= batchJobMetric(len(_batchJobMetric_index)-1) {
 		return "batchJobMetric(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
 	return _batchJobMetric_name[_batchJobMetric_index[i]:_batchJobMetric_index[i+1]]

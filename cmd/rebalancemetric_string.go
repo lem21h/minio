@@ -20,7 +20,7 @@ const _rebalanceMetric_name = "RebalanceBucketsRebalanceBucketRebalanceObjectReb
 var _rebalanceMetric_index = [...]uint8{0, 16, 31, 46, 67, 79}
 
 func (i rebalanceMetric) String() string {
-	if i >= rebalanceMetric(len(_rebalanceMetric_index)-1) {
+	if i < 0 || i >= rebalanceMetric(len(_rebalanceMetric_index)-1) {
 		return "rebalanceMetric(" + strconv.FormatInt(int64(i), 10) + ")"
 	}
 	return _rebalanceMetric_name[_rebalanceMetric_index[i]:_rebalanceMetric_index[i+1]]

@@ -50,7 +50,7 @@ type ARN struct {
 
 // Allows english letters, numbers, '.', '-', '_' and '/'. Starts with a
 // letter or digit. At least 1 character long.
-var validResourceIDRegex = regexp.MustCompile(`[A-Za-z0-9_/\.-]+$`)
+var validResourceIDRegex = regexp.MustCompile(`[A-Za-z0-9_./-]+$`)
 
 // NewIAMRoleARN - returns an ARN for a role in MinIO.
 func NewIAMRoleARN(resourceID, serverRegion string) (ARN, error) {

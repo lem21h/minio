@@ -411,3 +411,26 @@ func TestStorageRESTClientRenameFile(t *testing.T) {
 
 	testStorageAPIRenameFile(t, restClient)
 }
+
+// TestStorageRESTClientPathTraversal verifies that ReadMultiple, ReadParts, and
+// DeleteBulk all reject ".." traversal sequences smuggled in the msgpack body
+// (CVE-2026-42600). The global setRequestValidityMiddleware only inspects
+// r.URL.Path and form values, so without handler-level checks a caller holding
+// the cluster root JWT could escape the configured drive root.
+func TestStorageRESTClientPathTraversal(t *testing.T) {
+	restClient := newStorageRESTHTTPServerClient(t)
+
+	t.Run("ReadParts", func(t *testing.T) {
+		_, err := restClient.ReadParts(t.Context(), "foo", "../etc/passwd")
+		if err == nil {
+			t.Fatal("expected error for traversal in ReadParts paths, got nil")
+		}
+	})
+
+	t.Run("DeleteBulk", func(t *testing.T) {
+		err := restClient.DeleteBulk(t.Context(), "foo", "../etc/shadow")
+		if err == nil {
+			t.Fatal("expected error for traversal in DeleteBulk paths, got nil")
+		}
+	})
+}

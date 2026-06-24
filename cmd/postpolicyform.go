@@ -186,7 +186,7 @@ func parsePostPolicyForm(r io.Reader) (PostPolicyForm, error) {
 			for k, v := range condt {
 				if !isString(v) { // Pre-check value type.
 					// All values must be of type string.
-					return parsedPolicy, fmt.Errorf("Unknown type %s of conditional field value %s found in POST policy form", reflect.TypeOf(condt).String(), condt)
+					return parsedPolicy, fmt.Errorf("Unknown type %s of conditional field value %s found in POST policy form", reflect.TypeFor[map[string]any]().String(), condt)
 				}
 				// {"acl": "public-read" } is an alternate way to indicate - [ "eq", "$acl", "public-read" ]
 				// In this case we will just collapse this into "eq" for all use cases.
@@ -240,7 +240,7 @@ func parsePostPolicyForm(r io.Reader) (PostPolicyForm, error) {
 			default:
 				// Condition should be valid.
 				return parsedPolicy, fmt.Errorf("Unknown type %s of conditional field value %s found in POST policy form",
-					reflect.TypeOf(condt).String(), condt)
+					reflect.TypeFor[[]any]().String(), condt)
 			}
 		default:
 			return parsedPolicy, fmt.Errorf("Unknown field %s of type %s found in POST policy form",

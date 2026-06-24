@@ -150,14 +150,15 @@ func (t *testLogger) Send(ctx context.Context, entry any) error {
 		if v.Trace == nil {
 			logf("%s: %s", v.Level, v.Message)
 		} else {
-			msg := fmt.Sprintf("%s: %+v", v.Level, v.Trace.Message)
+			var msg strings.Builder
+			msg.WriteString(fmt.Sprintf("%s: %+v", v.Level, v.Trace.Message))
 			for i, m := range v.Trace.Source {
 				if i == 0 && strings.Contains(m, "logger.go:") {
 					continue
 				}
-				msg += fmt.Sprintf("\n%s", m)
+				msg.WriteString(fmt.Sprintf("\n%s", m))
 			}
-			logf("%s", msg)
+			logf("%s", msg.String())
 		}
 	default:
 		logf("%+v (%T)", v, v)

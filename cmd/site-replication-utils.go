@@ -177,11 +177,9 @@ func (sm *siteResyncMetrics) save(ctx context.Context) {
 						}
 						rs.LastSaved = UTCNow()
 						sm.peerResyncMap[dID] = rs
-						wg.Add(1)
-						go func() {
-							defer wg.Done()
+						wg.Go(func() {
 							saveSiteResyncMetadata(ctx, st, newObjectLayerFn())
-						}()
+						})
 					}
 				}
 				wg.Wait()

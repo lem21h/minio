@@ -285,8 +285,7 @@ func (f *sftpDriver) Filewrite(r *sftp.Request) (w io.WriterAt, err error) {
 		r:      pr,
 		wg:     &sync.WaitGroup{},
 	}
-	wa.wg.Add(1)
-	go func() {
+	wa.wg.Go(func() {
 		oi, err := clnt.PutObject(r.Context(), bucket, object, pr, -1, minio.PutObjectOptions{
 			ContentType:          mimedb.TypeByExtension(path.Ext(object)),
 			DisableContentSha256: true,
@@ -294,8 +293,7 @@ func (f *sftpDriver) Filewrite(r *sftp.Request) (w io.WriterAt, err error) {
 		})
 		stopFn(oi.Size, err)
 		pr.CloseWithError(err)
-		wa.wg.Done()
-	}()
+	})
 	return wa, nil
 }
 

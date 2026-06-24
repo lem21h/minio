@@ -26,7 +26,6 @@ import (
 	"strings"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/azcore"
-	"github.com/Azure/azure-sdk-for-go/sdk/azcore/to"
 	"github.com/Azure/azure-sdk-for-go/sdk/azidentity"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob"
 	"github.com/Azure/azure-sdk-for-go/sdk/storage/azblob/blob"
@@ -63,7 +62,7 @@ func (az *warmBackendAzure) getDest(object string) string {
 func (az *warmBackendAzure) PutWithMeta(ctx context.Context, object string, r io.Reader, length int64, meta map[string]string) (remoteVersionID, error) {
 	azMeta := map[string]*string{}
 	for k, v := range meta {
-		azMeta[k] = to.Ptr(v)
+		azMeta[k] = new(v)
 	}
 	resp, err := az.clnt.UploadStream(ctx, az.Bucket, az.getDest(object), io.LimitReader(r, length), &azblob.UploadStreamOptions{
 		Concurrency: 4,

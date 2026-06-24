@@ -285,16 +285,15 @@ func (er erasureObjects) getOnlineDisksWithHealingAndInfo(inclHealing bool) (new
 	infos := make([]DiskInfo, len(disks))
 	r := rand.New(rand.NewSource(time.Now().UnixNano()))
 	for _, i := range r.Perm(len(disks)) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		disk := disks[i]
+		if disk == nil {
+			infos[i].Error = errDiskNotFound.Error()
+			continue
+		}
 
-			disk := disks[i]
-			if disk == nil {
-				infos[i].Error = errDiskNotFound.Error()
-				return
-			}
+		i, disk := i, disk
 
+		wg.Go(func() {
 			di, err := disk.DiskInfo(context.Background(), DiskInfoOptions{})
 			infos[i] = di
 			if err != nil {
@@ -302,7 +301,7 @@ func (er erasureObjects) getOnlineDisksWithHealingAndInfo(inclHealing bool) (new
 				//   unformatted or simply not accessible for some reason.
 				infos[i].Error = err.Error()
 			}
-		}()
+		})
 	}
 	wg.Wait()
 

@@ -129,13 +129,10 @@ func (dt *dynamicTimeout) adjust(entries [dynamicTimeoutLogSize]time.Duration) {
 
 	if failPct > dynamicTimeoutIncreaseThresholdPct {
 		// We are hitting the timeout too often, so increase the timeout by 25%
-		timeout := min(
+		timeout := max(
 			// Set upper cap.
-			atomic.LoadInt64(&dt.timeout)*125/100, int64(maxDynamicTimeout))
-		// Safety, shouldn't happen
-		if timeout < dt.minimum {
-			timeout = dt.minimum
-		}
+			min(atomic.LoadInt64(&dt.timeout)*125/100, int64(maxDynamicTimeout)),
+			dt.minimum)
 		atomic.StoreInt64(&dt.timeout, timeout)
 	} else if failPct < dynamicTimeoutDecreaseThresholdPct {
 		// We are hitting the timeout relatively few times,

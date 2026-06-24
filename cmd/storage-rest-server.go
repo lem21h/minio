@@ -254,15 +254,13 @@ func (s *storageRESTServer) NSScannerHandler(ctx context.Context, params *nsScan
 	// Collect updates, stream them before the full cache is sent.
 	updates := make(chan dataUsageEntry, 1)
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for update := range updates {
 			resp := storageNSScannerRPC.NewResponse()
 			resp.Update = &update
 			out <- resp
 		}
-	}()
+	})
 	ui, err := s.getStorage().NSScanner(ctx, *params.Cache, updates, madmin.HealScanMode(params.ScanMode), nil)
 	wg.Wait()
 	if err != nil {
@@ -541,6 +539,14 @@ func (s *storageRESTServer) ReadPartsHandler(w http.ResponseWriter, r *http.Requ
 	if err := msgp.Decode(r.Body, &preq); err != nil {
 		s.writeErrorResponse(w, err)
 		return
+	}
+
+	// Reject path traversal smuggled through msgpack body (CVE-2026-42600).
+	for _, p := range preq.Paths {
+		if hasBadPathComponent(p) {
+			s.writeErrorResponse(w, errInvalidArgument)
+			return
+		}
 	}
 
 	done := keepHTTPResponseAlive(w)
@@ -1276,6 +1282,14 @@ func (s *storageRESTServer) DeleteBulkHandler(w http.ResponseWriter, r *http.Req
 	if err := req.DecodeMsg(mr); err != nil {
 		s.writeErrorResponse(w, err)
 		return
+	}
+
+	// Reject path traversal smuggled through msgpack body (CVE-2026-42600).
+	for _, p := range req.Paths {
+		if hasBadPathComponent(p) {
+			s.writeErrorResponse(w, errInvalidArgument)
+			return
+		}
 	}
 
 	volume := r.Form.Get(storageRESTVolume)

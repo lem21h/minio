@@ -437,6 +437,7 @@ func (s3Select *S3Select) Open(rsc io.ReadSeekCloser) error {
 
 		if strings.EqualFold(s3Select.Input.JSONArgs.ContentType, "lines") {
 			// PReader enforces the S3 Select per-record size limit while splitting lines.
+			//TODO: add simdj.NewReader
 			s3Select.recordReader = json.NewPReader(s3Select.progressReader, &s3Select.Input.JSONArgs)
 		} else {
 			// Document mode.

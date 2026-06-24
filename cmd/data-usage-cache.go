@@ -635,11 +635,12 @@ func (d *dataUsageCache) forceCompact(limit int) {
 // StringAll returns a detailed string representation of all entries in the cache.
 func (d *dataUsageCache) StringAll() string {
 	// Remove bloom filter from print.
-	s := fmt.Sprintf("info:%+v\n", d.Info)
+	var s strings.Builder
+	s.WriteString(fmt.Sprintf("info:%+v\n", d.Info))
 	for k, v := range d.Cache {
-		s += fmt.Sprintf("\t%v: %+v\n", k, v)
+		s.WriteString(fmt.Sprintf("\t%v: %+v\n", k, v))
 	}
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(s.String())
 }
 
 // String returns a human readable representation of the string.
