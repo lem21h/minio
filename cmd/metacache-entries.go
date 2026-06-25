@@ -20,8 +20,8 @@ package cmd
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
-	"path"
 	"sort"
 	"strings"
 
@@ -44,7 +44,9 @@ type metaCacheEntry struct {
 	reusable bool
 }
 
-// isDir returns if the entry is representing a prefix directory.
+// isDir reports whether the entry represents a synthetic prefix directory.
+//
+// Directory entries have no object metadata and their name ends with "/".
 func (e metaCacheEntry) isDir() bool {
 	return len(e.metadata) == 0 && strings.HasSuffix(e.name, slashSeparator)
 }
@@ -54,7 +56,7 @@ func (e metaCacheEntry) isObject() bool {
 	return len(e.metadata) > 0
 }
 
-// isObjectDir returns if the entry is representing an object/
+// isObjectDir returns whether the entry represents an object whose name ends with "/".
 func (e metaCacheEntry) isObjectDir() bool {
 	return len(e.metadata) > 0 && strings.HasSuffix(e.name, slashSeparator)
 }
@@ -85,12 +87,20 @@ func (e *metaCacheEntry) matches(other *metaCacheEntry, strict bool) (prefer *me
 		return other, false
 	}
 
-	if other.isDir() || e.isDir() {
-		if e.isDir() {
-			return e, other.isDir() == e.isDir()
+	// Directories/prefixes do not have xlmeta.
+	// If both are synthetic dirs, they match.
+	// If only one is synthetic dir, prefer the real object.
+	if e.isDir() || other.isDir() {
+		switch {
+		case e.isDir() && other.isDir():
+			return e, true
+		case e.isDir():
+			return other, false
+		default:
+			return e, false
 		}
-		return other, other.isDir() == e.isDir()
 	}
+
 	eVers, eErr := e.xlmeta()
 	oVers, oErr := other.xlmeta()
 	if eErr != nil || oErr != nil {
@@ -116,6 +126,7 @@ func (e *metaCacheEntry) matches(other *metaCacheEntry, strict bool) (prefer *me
 	}
 
 	// Check if each version matches...
+	//TODO: check if this versions come ordered, otherwise it can report false mismatches.
 	for i, eVer := range eVers.versions {
 		oVer := oVers.versions[i]
 		if eVer.header != oVer.header {
@@ -156,20 +167,32 @@ func (e *metaCacheEntry) matches(other *metaCacheEntry, strict bool) (prefer *me
 	return prefer, true
 }
 
-// isInDir returns whether the entry is in the dir when considering the separator.
+// isInDir returns whether the entry is directly inside dir when considering separator.
+//
+// dir is expected to be either empty for root, or normalized to end with separator.
 func (e metaCacheEntry) isInDir(dir, separator string) bool {
-	if len(dir) == 0 {
-		// Root
+	if separator == "" {
+		return false
+	}
+
+	// safer if callers may pass dir without trailing /
+	if dir != "" && !strings.HasSuffix(dir, separator) {
+		dir += separator
+	}
+
+	if dir == "" {
 		idx := strings.Index(e.name, separator)
 		return idx == -1 || idx == len(e.name)-len(separator)
 	}
-	ext := strings.TrimPrefix(e.name, dir)
-	if len(ext) != len(e.name) {
-		idx := strings.Index(ext, separator)
-		// If separator is not found or is last entry, ok.
-		return idx == -1 || idx == len(ext)-len(separator)
+
+	if !strings.HasPrefix(e.name, dir) {
+		return false
 	}
-	return false
+
+	ext := strings.TrimPrefix(e.name, dir)
+	idx := strings.Index(ext, separator)
+
+	return idx == -1 || idx == len(ext)-len(separator)
 }
 
 // isLatestDeletemarker returns whether the latest version is a delete marker.
@@ -185,10 +208,13 @@ func (e *metaCacheEntry) isLatestDeletemarker() bool {
 	if !isXL2V1Format(e.metadata) {
 		return false
 	}
-	if meta, _, err := isIndexedMetaV2(e.metadata); meta != nil {
-		return meta.IsLatestDeleteMarker()
-	} else if err != nil {
+	// stricter around isIndexedMetaV2() errors
+	meta, _, err := isIndexedMetaV2(e.metadata)
+	if err != nil {
 		return true
+	}
+	if meta != nil {
+		return meta.IsLatestDeleteMarker()
 	}
 	// Fall back...
 	xlMeta, err := e.xlmeta()
@@ -213,21 +239,25 @@ func (e *metaCacheEntry) isAllFreeVersions() bool {
 		}
 		return true
 	}
+
 	if !isXL2V1Format(e.metadata) {
 		return false
 	}
-	if meta, _, err := isIndexedMetaV2(e.metadata); meta != nil {
-		return meta.AllHidden(false)
-	} else if err != nil {
+	meta, _, err := isIndexedMetaV2(e.metadata)
+	if err != nil {
 		return true
 	}
+	if meta != nil {
+		return meta.AllHidden(false)
+	}
+
 	// Fall back...
 	xlMeta, err := e.xlmeta()
 	if err != nil || len(xlMeta.versions) == 0 {
 		return true
 	}
-	// Check versions..
-	for _, v := range e.cached.versions {
+	// still can be e.cached may still be nil
+	for _, v := range xlMeta.versions {
 		if !v.header.FreeVersion() {
 			return false
 		}
@@ -259,6 +289,12 @@ func (e *metaCacheEntry) fileInfo(bucket string) (FileInfo, error) {
 		}
 		return e.cached.ToFileInfo(bucket, e.name, "", false, true)
 	}
+
+	// protect against malformed entries
+	if len(e.metadata) == 0 {
+		return FileInfo{}, fmt.Errorf("metaCacheEntry: no metadata for non-directory entry %q", e.name)
+	}
+
 	return getFileInfo(e.metadata, bucket, e.name, "", fileInfoOpts{})
 }
 
@@ -268,18 +304,18 @@ func (e *metaCacheEntry) xlmeta() (*xlMetaV2, error) {
 	if e.isDir() {
 		return nil, errFileNotFound
 	}
-	if e.cached == nil {
-		if len(e.metadata) == 0 {
-			// only happens if the entry is not found.
-			return nil, errFileNotFound
-		}
-		var xl xlMetaV2
-		err := xl.LoadOrConvert(e.metadata)
-		if err != nil {
-			return nil, err
-		}
-		e.cached = &xl
+	if e.cached != nil {
+		return e.cached, nil
 	}
+	if len(e.metadata) == 0 {
+		// Only happens if the entry is not found or malformed.
+		return nil, errFileNotFound
+	}
+	var xl xlMetaV2
+	if err := xl.LoadOrConvert(e.metadata); err != nil {
+		return nil, err
+	}
+	e.cached = &xl
 	return e.cached, nil
 }
 
@@ -298,6 +334,10 @@ func (e *metaCacheEntry) fileInfoVersions(bucket string) (FileInfoVersions, erro
 				},
 			},
 		}, nil
+	}
+	// for non-directory entry with empty metadata
+	if len(e.metadata) == 0 {
+		return FileInfoVersions{}, errFileNotFound
 	}
 	// Too small gains to reuse cache here.
 	return getFileInfoVersions(e.metadata, bucket, e.name, true)
@@ -356,17 +396,23 @@ type metadataResolutionParams struct {
 // entries are resolved by majority, then if tied by mod-time and versions.
 // Names must match on all entries in m.
 func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCacheEntry, ok bool) {
-	if len(m) == 0 {
+	if len(m) == 0 || r == nil {
 		return nil, false
 	}
 
-	dirExists := 0
 	if cap(r.candidates) < len(m) {
 		r.candidates = make([][]xlMetaV2ShallowVersion, 0, len(m))
 	}
 	r.candidates = r.candidates[:0]
+
+	// Separate object and dir selection
+	var dirSelected *metaCacheEntry
+	var objSelected *metaCacheEntry
+
+	dirExists := 0
 	objsAgree := 0
 	objsValid := 0
+
 	for i := range m {
 		entry := &m[i]
 		// Empty entry
@@ -376,7 +422,9 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 
 		if entry.isDir() {
 			dirExists++
-			selected = entry
+			if dirSelected == nil {
+				dirSelected = entry
+			}
 			continue
 		}
 
@@ -393,71 +441,72 @@ func (m metaCacheEntries) resolve(r *metadataResolutionParams) (selected *metaCa
 
 		// We select the first object we find as a candidate and see if all match that.
 		// This is to quickly identify if all agree.
-		if selected == nil {
-			selected = entry
+		if objSelected == nil {
+			objSelected = entry
 			objsAgree = 1
 			continue
 		}
 		// Names match, check meta...
-		if prefer, ok := entry.matches(selected, r.strict); ok {
-			selected = prefer
+		if prefer, matches := entry.matches(objSelected, r.strict); matches {
+			objSelected = prefer
 			objsAgree++
-			continue
 		}
 	}
 
-	// Return dir entries, if enough...
-	if selected != nil && selected.isDir() && dirExists >= r.dirQuorum {
-		return selected, true
+	// Prefer real object metadata if object quorum exists.
+	if objsValid >= r.objQuorum {
+		if objSelected == nil || objSelected.cached == nil {
+			return nil, false
+		}
+		if objsAgree == objsValid {
+			return objSelected, true
+		}
+
+		merged := &metaCacheEntry{
+			name:     objSelected.name,
+			reusable: true,
+			cached:   &xlMetaV2{metaV: objSelected.cached.metaV},
+		}
+		merged.cached.versions = mergeXLV2Versions(r.objQuorum, r.strict, r.requestedVersions, r.candidates...)
+
+		if len(merged.cached.versions) == 0 {
+			return nil, false
+		}
+
+		buf := metaDataPoolGet()
+		var err error
+		// it may lose the pooled buffer if AppendTo fails
+		merged.metadata, err = merged.cached.AppendTo(buf)
+		if err != nil {
+			metaDataPoolPut(buf)
+			bugLogIf(context.Background(), err)
+			return nil, false
+		}
+
+		return merged, true
 	}
 
-	// If we would never be able to reach read quorum.
-	if objsValid < r.objQuorum {
-		return nil, false
+	// Fall back to synthetic directory only if object quorum was not reached.
+	if dirSelected != nil && dirExists >= r.dirQuorum {
+		return dirSelected, true
 	}
 
-	// If all objects agree.
-	if selected != nil && objsAgree == objsValid {
-		return selected, true
-	}
-
-	// If cached is nil we shall skip the entry.
-	if selected.cached == nil {
-		return nil, false
-	}
-
-	// Merge if we have disagreement.
-	// Create a new merged result.
-	selected = &metaCacheEntry{
-		name:     selected.name,
-		reusable: true,
-		cached:   &xlMetaV2{metaV: selected.cached.metaV},
-	}
-	selected.cached.versions = mergeXLV2Versions(r.objQuorum, r.strict, r.requestedVersions, r.candidates...)
-	if len(selected.cached.versions) == 0 {
-		return nil, false
-	}
-
-	// Reserialize
-	var err error
-	selected.metadata, err = selected.cached.AppendTo(metaDataPoolGet())
-	if err != nil {
-		bugLogIf(context.Background(), err)
-		return nil, false
-	}
-	return selected, true
+	return nil, false
 }
 
 // firstFound returns the first found and the number of set entries.
 func (m metaCacheEntries) firstFound() (first *metaCacheEntry, n int) {
-	for i, entry := range m {
-		if entry.name != "" {
-			n++
-			if first == nil {
-				first = &m[i]
-			}
+	// avoids copying each metaCacheEntry during range iteration
+	for i := range m {
+		if m[i].name == "" {
+			continue
+		}
+		n++
+		if first == nil {
+			first = &m[i]
 		}
 	}
+
 	return first, n
 }
 
@@ -497,22 +546,33 @@ func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, aft
 	prevPrefix := ""
 	vcfg, _ := globalBucketVersioningSys.Get(bucket)
 
-	for _, entry := range m.o {
+	for i := range m.o {
+		// avoid copying
+		entry := &m.o[i]
+
+		if prefix != "" && !strings.HasPrefix(entry.name, prefix) {
+			continue
+		}
+
 		if entry.isObject() {
 			if delimiter != "" {
-				idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+				rest := strings.TrimPrefix(entry.name, prefix)
+
+				idx := strings.Index(rest, delimiter)
 				if idx >= 0 {
 					idx = len(prefix) + idx + len(delimiter)
 					currPrefix := entry.name[:idx]
 					if currPrefix == prevPrefix {
 						continue
 					}
+
 					prevPrefix = currPrefix
 					versions = append(versions, ObjectInfo{
 						IsDir:  true,
 						Bucket: bucket,
 						Name:   currPrefix,
 					})
+
 					continue
 				}
 			}
@@ -531,11 +591,12 @@ func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, aft
 				afterV = ""
 			}
 
+			versioned := vcfg != nil && vcfg.Versioned(entry.name)
+
 			for _, version := range fiVersions {
 				if !version.VersionPurgeStatus().Empty() {
 					continue
 				}
-				versioned := vcfg != nil && vcfg.Versioned(entry.name)
 				versions = append(versions, version.ToObjectInfo(bucket, entry.name, versioned))
 			}
 
@@ -546,15 +607,19 @@ func (m *metaCacheEntriesSorted) fileInfoVersions(bucket, prefix, delimiter, aft
 			if delimiter == "" {
 				continue
 			}
-			idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+			rest := strings.TrimPrefix(entry.name, prefix)
+
+			idx := strings.Index(rest, delimiter)
 			if idx < 0 {
 				continue
 			}
+
 			idx = len(prefix) + idx + len(delimiter)
 			currPrefix := entry.name[:idx]
 			if currPrefix == prevPrefix {
 				continue
 			}
+
 			prevPrefix = currPrefix
 			versions = append(versions, ObjectInfo{
 				IsDir:  true,
@@ -575,16 +640,24 @@ func (m *metaCacheEntriesSorted) fileInfos(bucket, prefix, delimiter string) (ob
 
 	vcfg, _ := globalBucketVersioningSys.Get(bucket)
 
-	for _, entry := range m.o {
+	for i := range m.o {
+		// avoid copy
+		entry := &m.o[i]
+
+		if prefix != "" && !strings.HasPrefix(entry.name, prefix) {
+			continue
+		}
 		if entry.isObject() {
 			if delimiter != "" {
-				idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+				rest := strings.TrimPrefix(entry.name, prefix)
+				idx := strings.Index(rest, delimiter)
 				if idx >= 0 {
 					idx = len(prefix) + idx + len(delimiter)
 					currPrefix := entry.name[:idx]
 					if currPrefix == prevPrefix {
 						continue
 					}
+
 					prevPrefix = currPrefix
 					objects = append(objects, ObjectInfo{
 						IsDir:  true,
@@ -606,7 +679,8 @@ func (m *metaCacheEntriesSorted) fileInfos(bucket, prefix, delimiter string) (ob
 			if delimiter == "" {
 				continue
 			}
-			idx := strings.Index(strings.TrimPrefix(entry.name, prefix), delimiter)
+			rest := strings.TrimPrefix(entry.name, prefix)
+			idx := strings.Index(rest, delimiter)
 			if idx < 0 {
 				continue
 			}
@@ -627,7 +701,9 @@ func (m *metaCacheEntriesSorted) fileInfos(bucket, prefix, delimiter string) (ob
 	return objects
 }
 
-// forwardTo will truncate m so only entries that are s or after is in the list.
+// forwardTo will truncate m so only entries that are s or after are in the list.
+//
+// Requires m.o to be sorted by name.
 func (m *metaCacheEntriesSorted) forwardTo(s string) {
 	if s == "" {
 		return
@@ -635,11 +711,13 @@ func (m *metaCacheEntriesSorted) forwardTo(s string) {
 	idx := sort.Search(len(m.o), func(i int) bool {
 		return m.o[i].name >= s
 	})
-	if m.reuse {
-		for i, entry := range m.o[:idx] {
-			metaDataPoolPut(entry.metadata)
-			m.o[i].metadata = nil
+	for i := range m.o[:idx] {
+		if m.reuse && cap(m.o[i].metadata) >= metaDataReadDefault {
+			metaDataPoolPut(m.o[i].metadata)
 		}
+		// Clear references so skipped entries do not stay alive through
+		// the backing array.
+		m.o[i] = metaCacheEntry{}
 	}
 
 	m.o = m.o[idx:]
@@ -662,21 +740,50 @@ func (m *metaCacheEntriesSorted) forwardPast(s string) {
 	m.o = m.o[idx:]
 }
 
-// mergeEntryChannels will merge entries from in and return them sorted on out.
+// mergeEntryChannels will merge sorted entries from in and return them sorted on out.
 // To signify no more results are on an input channel, close it.
 // The output channel will be closed when all inputs are emptied.
-// If file names are equal, compareMeta is called to select which one to choose.
+// If file names are equal, metadata is merged/resolved.
 // The entry not chosen will be discarded.
 // If the context is canceled the function will return the error,
 // otherwise the function will return nil.
+//
+// Each input channel must produce entries sorted by name.
 func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<- metaCacheEntry, readQuorum int) error {
 	defer xioutil.SafeClose(out)
-	top := make([]*metaCacheEntry, len(in))
-	nDone := 0
+
 	ctxDone := ctx.Done()
 
-	// Use simpler forwarder.
+	releaseEntry := func(e *metaCacheEntry) {
+		if e == nil {
+			return
+		}
+		if e.reusable && e.metadata != nil {
+			metaDataPoolPut(e.metadata)
+		}
+		e.metadata = nil
+		e.cached = nil
+	}
+
+	// Do not use path.Clean here. Object keys may legally contain repeated
+	// slashes or "." / ".." segments. We only want to treat "name" and "name/"
+	// as the same logical listing position for dir/object conflict handling.
+	sameListedName := func(a, b string) bool {
+		if a == b {
+			return true
+		}
+		return strings.TrimSuffix(a, slashSeparator) == strings.TrimSuffix(b, slashSeparator)
+	}
+
+	if len(in) == 0 {
+		return nil
+	}
+
+	// Simple forwarder for one input.
 	if len(in) == 1 {
+		if in[0] == nil {
+			return nil
+		}
 		for {
 			select {
 			case <-ctxDone:
@@ -687,6 +794,7 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 				}
 				select {
 				case <-ctxDone:
+					releaseEntry(&v)
 					return ctx.Err()
 				case out <- v:
 				}
@@ -694,201 +802,334 @@ func mergeEntryChannels(ctx context.Context, in []chan metaCacheEntry, out chan<
 		}
 	}
 
-	selectFrom := func(idx int) error {
+	top := make([]*metaCacheEntry, len(in))
+	done := make([]bool, len(in))
+	nDone := 0
+
+	releaseTop := func(idx int) {
+		releaseEntry(top[idx])
+		top[idx] = nil
+	}
+
+	defer func() {
+		for i := range top {
+			releaseTop(i)
+		}
+	}()
+
+	readTop := func(idx int) error {
+		if done[idx] {
+			top[idx] = nil
+			return nil
+		}
+
+		if in[idx] == nil {
+			done[idx] = true
+			top[idx] = nil
+			nDone++
+			return nil
+		}
+
 		select {
 		case <-ctxDone:
 			return ctx.Err()
 		case entry, ok := <-in[idx]:
 			if !ok {
 				top[idx] = nil
+				done[idx] = true
 				nDone++
-			} else {
-				top[idx] = &entry
+				return nil
 			}
+			top[idx] = &entry
+			return nil
 		}
-		return nil
 	}
-	// Populate all...
+
+	discardAndReadTop := func(idx int) error {
+		releaseTop(idx)
+		return readTop(idx)
+	}
+
+	// Populate initial heads.
 	for i := range in {
-		if err := selectFrom(i); err != nil {
+		if err := readTop(i); err != nil {
 			return err
 		}
 	}
 	last := ""
-	var toMerge []int
+	toMerge := make([]int, 0, len(in)-1)
 
-	// Choose the best to return.
 	for {
 		if nDone == len(in) {
 			return nil
 		}
-		best := top[0]
-		bestIdx := 0
+		var best *metaCacheEntry
+		bestIdx := -1
 		toMerge = toMerge[:0]
-		for i, other := range top[1:] {
-			otherIdx := i + 1
+
+		for i, other := range top {
 			if other == nil {
 				continue
 			}
 			if best == nil {
 				best = other
-				bestIdx = otherIdx
+				bestIdx = i
 				continue
 			}
-			if path.Clean(best.name) == path.Clean(other.name) {
-				// We may be in a situation where we have a directory and an object with the same name.
-				// In that case we will drop the directory entry.
-				// This should however not be confused with an object with a trailing slash.
+			if sameListedName(best.name, other.name) {
+				// We may have a synthetic directory and an object with the
+				// same logical listing name. Drop the synthetic directory.
 				dirMatches := best.isDir() == other.isDir()
 				suffixMatches := strings.HasSuffix(best.name, slashSeparator) == strings.HasSuffix(other.name, slashSeparator)
 
-				// Simple case. Both are same type with same suffix.
+				// Same type and same slash suffix: resolve/merge them.
 				if dirMatches && suffixMatches {
-					toMerge = append(toMerge, otherIdx)
+					toMerge = append(toMerge, i)
 					continue
 				}
 
 				if !dirMatches {
-					// We have an object `name` or 'name/' and a directory `name/`.
 					if other.isDir() {
 						if serverDebugLog {
 							console.Debugln("mergeEntryChannels: discarding directory", other.name, "for object", best.name)
 						}
-						// Discard the directory.
-						if err := selectFrom(otherIdx); err != nil {
+						if err := discardAndReadTop(i); err != nil {
 							return err
 						}
 						continue
 					}
-					// Replace directory with object.
 					if serverDebugLog {
 						console.Debugln("mergeEntryChannels: discarding directory", best.name, "for object", other.name)
 					}
 					toMerge = toMerge[:0]
 					best = other
-					bestIdx = otherIdx
+					bestIdx = i
 					continue
 				}
-				// Leave it to be resolved. Names are different.
+
+				// Same dir/object type but different slash suffix.
+				// Leave normal lexical ordering to decide.
 			}
 			if best.name > other.name {
 				toMerge = toMerge[:0]
 				best = other
-				bestIdx = otherIdx
+				bestIdx = i
 			}
 		}
+		if best == nil {
+			return nil
+		}
 
-		// Merge any unmerged
 		if len(toMerge) > 0 {
-			versions := make([][]xlMetaV2ShallowVersion, 0, len(toMerge)+1)
-			xl, err := best.xlmeta()
-			if err == nil {
-				versions = append(versions, xl.versions)
-			}
-			for _, idx := range toMerge {
-				other := top[idx]
-				if other == nil {
-					continue
-				}
-				xl2, err := other.xlmeta()
-				if err != nil {
-					if err := selectFrom(idx); err != nil {
+			// Duplicate synthetic directories: keep one, discard the rest.
+			if best.isDir() {
+				for _, idx := range toMerge {
+					if err := discardAndReadTop(idx); err != nil {
 						return err
 					}
-					continue
 				}
-				if xl == nil {
-					// Discard current "best"
-					if err := selectFrom(bestIdx); err != nil {
-						return err
-					}
-					bestIdx = idx
-					best = other
-					xl = xl2
+				toMerge = toMerge[:0]
+			} else {
+				versions := make([][]xlMetaV2ShallowVersion, 0, len(toMerge)+1)
+				xl, err := best.xlmeta()
+				if err == nil {
+					versions = append(versions, xl.versions)
 				} else {
-					// Mark read, unless we added it as new "best".
-					if err := selectFrom(idx); err != nil {
+					xl = nil
+				}
+				for _, idx := range toMerge {
+					other := top[idx]
+					if other == nil {
+						continue
+					}
+
+					xlOther, err := other.xlmeta()
+					if err != nil {
+						if err := discardAndReadTop(idx); err != nil {
+							return err
+						}
+						continue
+					}
+					if xl == nil {
+						// Current best was invalid. Discard it and promote
+						// the first valid duplicate.
+						if err := discardAndReadTop(bestIdx); err != nil {
+							return err
+						}
+						best = other
+						bestIdx = idx
+						xl = xlOther
+					} else {
+						if err := discardAndReadTop(idx); err != nil {
+							return err
+						}
+					}
+					versions = append(versions, xlOther.versions)
+				}
+
+				if xl == nil || len(versions) == 0 {
+					if err := discardAndReadTop(bestIdx); err != nil {
 						return err
 					}
+					continue
 				}
-				versions = append(versions, xl2.versions)
-			}
 
-			if xl != nil && len(versions) > 0 {
-				// Merge all versions. 'strict' doesn't matter since we only need one.
-				xl.versions = mergeXLV2Versions(readQuorum, true, 0, versions...)
-				if meta, err := xl.AppendTo(metaDataPoolGet()); err == nil {
-					if best.reusable {
-						metaDataPoolPut(best.metadata)
+				mergedVersions := mergeXLV2Versions(readQuorum, true, 0, versions...)
+				// no longer emits best when duplicate metadata merge fails to satisfy quorum
+				if len(mergedVersions) == 0 {
+					if err := discardAndReadTop(bestIdx); err != nil {
+						return err
 					}
-					best.metadata = meta
-					best.cached = xl
+					continue
 				}
+
+				xl.versions = mergedVersions
+
+				buf := metaDataPoolGet()
+				meta, err := xl.AppendTo(buf)
+				if err != nil {
+					metaDataPoolPut(buf)
+					bugLogIf(context.Background(), err)
+
+					if err := discardAndReadTop(bestIdx); err != nil {
+						return err
+					}
+					continue
+				}
+				if best.reusable && best.metadata != nil {
+					metaDataPoolPut(best.metadata)
+				}
+
+				best.metadata = meta
+				best.cached = xl
+				best.reusable = true
 			}
-			toMerge = toMerge[:0]
 		}
+
 		if best.name > last {
 			select {
 			case <-ctxDone:
 				return ctx.Err()
 			case out <- *best:
 				last = best.name
+
+				// Ownership of best.metadata has moved to the receiver.
+				// Clear top before readTop so deferred cleanup does not
+				// return metadata that was already sent.
+				top[bestIdx] = nil
 			}
-		} else if serverDebugLog {
+			if err := readTop(bestIdx); err != nil {
+				return err
+			}
+			continue
+		}
+
+		if serverDebugLog {
 			console.Debugln("mergeEntryChannels: discarding duplicate", best.name, "<=", last)
 		}
-		// Replace entry we just sent.
-		if err := selectFrom(bestIdx); err != nil {
+
+		if err := discardAndReadTop(bestIdx); err != nil {
 			return err
 		}
 	}
 }
 
 // merge will merge other into m.
-// If the same entries exists in both and metadata matches only one is added,
-// otherwise the entry from m will be placed first.
-// Operation time is expected to be O(n+m).
+// If the same entry exists in both and metadata matches, only one is added.
+// If names are equal but metadata differs, the entry from m is placed first.
+// Operation time is expected to be O(n+m), or O(limit) if limit > 0.
 func (m *metaCacheEntriesSorted) merge(other metaCacheEntriesSorted, limit int) {
-	merged := make(metaCacheEntries, 0, m.len()+other.len())
+	if limit == 0 {
+		m.o = nil
+		return
+	}
+
 	a := m.entries()
 	b := other.entries()
-	for len(a) > 0 && len(b) > 0 {
-		switch {
-		case a[0].name == b[0].name && bytes.Equal(a[0].metadata, b[0].metadata):
-			// Same, discard one.
-			merged = append(merged, a[0])
-			a = a[1:]
-			b = b[1:]
-		case a[0].name < b[0].name:
-			merged = append(merged, a[0])
-			a = a[1:]
-		default:
-			merged = append(merged, b[0])
-			b = b[1:]
+	capHint := len(a) + len(b)
+	if limit > 0 && capHint > limit {
+		capHint = limit
+	}
+
+	merged := make(metaCacheEntries, 0, capHint)
+	appendOne := func(entry metaCacheEntry) bool {
+		if limit > 0 && len(merged) >= limit {
+			return false
 		}
+		merged = append(merged, entry)
+		return true
+	}
+	for len(a) > 0 && len(b) > 0 {
 		if limit > 0 && len(merged) >= limit {
 			break
 		}
+		switch {
+		case a[0].name == b[0].name:
+			if bytes.Equal(a[0].metadata, b[0].metadata) {
+				// Same entry, discard one.
+				if !appendOne(a[0]) {
+					break
+				}
+				a = a[1:]
+				b = b[1:]
+				continue
+			}
+			// Same name, different metadata.
+			// Preserve m first, as documented.
+			if !appendOne(a[0]) {
+				break
+			}
+			a = a[1:]
+		case a[0].name < b[0].name:
+			if !appendOne(a[0]) {
+				break
+			}
+			a = a[1:]
+		default:
+			if !appendOne(b[0]) {
+				break
+			}
+			b = b[1:]
+		}
 	}
-	// Append anything left.
-	if limit < 0 || len(merged) < limit {
-		merged = append(merged, a...)
-		merged = append(merged, b...)
+	for len(a) > 0 && (limit < 0 || len(merged) < limit) {
+		merged = append(merged, a[0])
+		a = a[1:]
+	}
+	for len(b) > 0 && (limit < 0 || len(merged) < limit) {
+		merged = append(merged, b[0])
+		b = b[1:]
 	}
 	m.o = merged
 }
 
 // filterPrefix will filter m to only contain entries with the specified prefix.
+//
+// Requires m.o to be sorted by name.
 func (m *metaCacheEntriesSorted) filterPrefix(s string) {
-	if s == "" {
+	if m == nil || s == "" {
 		return
 	}
+
 	m.forwardTo(s)
-	for i, o := range m.o {
-		if !o.hasPrefix(s) {
-			m.o = m.o[:i]
-			break
+	for i := range m.o {
+		if m.o[i].hasPrefix(s) {
+			continue
 		}
+		if m.reuse {
+			for j := i; j < len(m.o); j++ {
+				if cap(m.o[j].metadata) >= metaDataReadDefault {
+					metaDataPoolPut(m.o[j].metadata)
+				}
+				m.o[j] = metaCacheEntry{}
+			}
+		} else {
+			for j := i; j < len(m.o); j++ {
+				m.o[j] = metaCacheEntry{}
+			}
+		}
+		m.o = m.o[:i]
+		return
 	}
 }
 
@@ -896,10 +1137,15 @@ func (m *metaCacheEntriesSorted) filterPrefix(s string) {
 // Order is preserved, but the underlying slice is modified.
 func (m *metaCacheEntriesSorted) filterObjectsOnly() {
 	dst := m.o[:0]
-	for _, o := range m.o {
-		if !o.isDir() {
-			dst = append(dst, o)
+	for i := range m.o {
+		if !m.o[i].isDir() {
+			dst = append(dst, m.o[i])
 		}
+	}
+	// Clear the tail so removed entries do not remain referenced
+	// by the underlying array.
+	for i := len(dst); i < len(m.o); i++ {
+		m.o[i] = metaCacheEntry{}
 	}
 	m.o = dst
 }
@@ -908,10 +1154,19 @@ func (m *metaCacheEntriesSorted) filterObjectsOnly() {
 // Order is preserved, but the underlying slice is modified.
 func (m *metaCacheEntriesSorted) filterPrefixesOnly() {
 	dst := m.o[:0]
-	for _, o := range m.o {
-		if o.isDir() {
-			dst = append(dst, o)
+	for i := range m.o {
+		if m.o[i].isDir() {
+			dst = append(dst, m.o[i])
+			continue
 		}
+		if m.reuse && cap(m.o[i].metadata) >= metaDataReadDefault {
+			metaDataPoolPut(m.o[i].metadata)
+		}
+	}
+	// Clear the tail so removed entries do not stay referenced
+	// by the underlying array.
+	for i := len(dst); i < len(m.o); i++ {
+		m.o[i] = metaCacheEntry{}
 	}
 	m.o = dst
 }
@@ -921,25 +1176,47 @@ func (m *metaCacheEntriesSorted) filterPrefixesOnly() {
 // To return root elements only set prefix to an empty string.
 // Order is preserved, but the underlying slice is modified.
 func (m *metaCacheEntriesSorted) filterRecursiveEntries(prefix, separator string) {
-	dst := m.o[:0]
+	if separator == "" {
+		return
+	}
+	if separator == "" {
+		return
+	}
+
 	if prefix != "" {
 		m.forwardTo(prefix)
-		for _, o := range m.o {
-			ext := strings.TrimPrefix(o.name, prefix)
-			if len(ext) != len(o.name) {
-				if !strings.Contains(ext, separator) {
-					dst = append(dst, o)
-				}
+	}
+
+	dst := m.o[:0]
+
+	for i := range m.o {
+		name := m.o[i].name
+
+		if prefix != "" {
+			if !strings.HasPrefix(name, prefix) {
+				break
+			}
+			ext := strings.TrimPrefix(name, prefix)
+			if ext == "" || !strings.Contains(ext, separator) {
+				dst = append(dst, m.o[i])
+				continue
+			}
+		} else {
+			if !strings.Contains(name, separator) {
+				dst = append(dst, m.o[i])
+				continue
 			}
 		}
-	} else {
-		// No prefix, simpler
-		for _, o := range m.o {
-			if !strings.Contains(o.name, separator) {
-				dst = append(dst, o)
-			}
+		if m.reuse && cap(m.o[i].metadata) >= metaDataReadDefault {
+			metaDataPoolPut(m.o[i].metadata)
 		}
 	}
+
+	for i := len(dst); i < len(m.o); i++ {
+		// Clear references held by the backing array.
+		m.o[i] = metaCacheEntry{}
+	}
+
 	m.o = dst
 }
 
@@ -948,15 +1225,20 @@ func (m *metaCacheEntriesSorted) truncate(n int) {
 	if m == nil {
 		return
 	}
-	if len(m.o) > n {
-		if m.reuse {
-			for i, entry := range m.o[n:] {
-				metaDataPoolPut(entry.metadata)
-				m.o[n+i].metadata = nil
-			}
-		}
-		m.o = m.o[:n]
+	if n < 0 {
+		n = 0
 	}
+	if len(m.o) <= n {
+		return
+	}
+	for i := n; i < len(m.o); i++ {
+		if m.reuse && cap(m.o[i].metadata) >= metaDataReadDefault {
+			metaDataPoolPut(m.o[i].metadata)
+		}
+		// Clear references held by the backing array.
+		m.o[i] = metaCacheEntry{}
+	}
+	m.o = m.o[:n]
 }
 
 // len returns the number of objects and prefix dirs in m.

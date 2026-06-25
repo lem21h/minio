@@ -124,6 +124,7 @@ func Test_metaCacheEntries_filterRecursive(t *testing.T) {
 	data.filterRecursiveEntries("src/compress/bzip2/", slashSeparator)
 	got := data.entries().names()
 	want := []string{"src/compress/bzip2/", "src/compress/bzip2/bit_reader.go", "src/compress/bzip2/bzip2.go", "src/compress/bzip2/bzip2_test.go", "src/compress/bzip2/huffman.go", "src/compress/bzip2/move_to_front.go"}
+	//               "src/compress/bzip2/", "src/compress/bzip2/bit_reader.go", "src/compress/bzip2/bzip2.go", "src/compress/bzip2/bzip2_test.go", "src/compress/bzip2/huffman.go", "src/compress/bzip2/move_to_front.go", "src/compress/bzip2/testdata/"
 	if !reflect.DeepEqual(want, got) {
 		t.Errorf("got unexpected result: %#v", got)
 	}
