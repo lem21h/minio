@@ -31,60 +31,104 @@ const markerTagVersion = "v2"
 // parseMarker will parse a marker possibly encoded with encodeMarker
 func (o *listPathOptions) parseMarker() {
 	s := o.Marker
+	start := strings.LastIndexByte(s, '[')
+	if start < 0 {
+		return
+	}
+	end := strings.LastIndexByte(s, ']')
+	if end < 0 || end < start {
+		return
+	}
+	// Usually encoded marker should be a suffix. If encodeMarker always appends
+	// the tag at the end, require this to avoid parsing unrelated brackets.
+	if end != len(s)-1 {
+		return
+	}
+
+	rawTag := s[start+1 : end]
+
+	fields := strings.Split(rawTag, ",")
+	if len(fields) == 0 {
+		return
+	}
+
+	parsed := make(map[string]string, len(fields))
+
+	for _, field := range fields {
+		k, v, ok := strings.Cut(field, ":")
+		if !ok {
+			continue
+		}
+		parsed[k] = v
+	}
+
+	if parsed["minio_cache"] != markerTagVersion {
+		return
+	}
+
+	// Only mutate Marker after validating that this is really our marker tag.
+	o.Marker = s[:start]
+
 	if !strings.Contains(s, "[minio_cache:"+markerTagVersion) {
 		return
 	}
-	start := strings.LastIndex(s, "[")
-	o.Marker = s[:start]
-	end := strings.LastIndex(s, "]")
-	tag := strings.Trim(s[start:end], "[]")
-	tags := strings.SplitSeq(tag, ",")
-	for tag := range tags {
-		kv := strings.Split(tag, ":")
-		if len(kv) < 2 {
-			continue
-		}
-		switch kv[0] {
+	for k, v := range parsed {
+		switch k {
 		case "minio_cache":
-			if kv[1] != markerTagVersion {
-				continue
-			}
+			// Already validated.
+
 		case "id":
-			o.ID = kv[1]
+			o.ID = v
+
 		case "return":
 			o.ID = mustGetUUID()
 			o.Create = true
+
 		case "p": // pool
-			v, err := strconv.ParseInt(kv[1], 10, 64)
-			if err != nil {
+			pool, err := strconv.Atoi(v)
+			if err != nil || pool < 0 {
 				o.ID = mustGetUUID()
 				o.Create = true
 				continue
 			}
-			o.pool = int(v)
+			o.pool = pool
+
 		case "s": // set
-			v, err := strconv.ParseInt(kv[1], 10, 64)
-			if err != nil {
+			set, err := strconv.Atoi(v)
+			if err != nil || set < 0 {
 				o.ID = mustGetUUID()
 				o.Create = true
 				continue
 			}
-			o.set = int(v)
+			o.set = set
+
 		default:
-			// Ignore unknown
+			// Ignore unknown fields.
 		}
 	}
 }
 
 // encodeMarker will encode a uuid and return it as a marker.
-// uuid cannot contain '[', ':' or ','.
+// uuid cannot contain '[', ']', ':' or ','.
 func (o listPathOptions) encodeMarker(marker string) string {
 	if o.ID == "" {
-		// Mark as returning listing...
+		// Mark as returning listing.
 		return fmt.Sprintf("%s[minio_cache:%s,return:]", marker, markerTagVersion)
 	}
-	if strings.ContainsAny(o.ID, "[:,") {
-		internalLogIf(context.Background(), fmt.Errorf("encodeMarker: uuid %s contained invalid characters", o.ID))
+	if strings.ContainsAny(o.ID, "[]:,") {
+		internalLogIf(context.Background(), fmt.Errorf("encodeMarker: uuid %q contained invalid characters", o.ID))
+
+		// Avoid emitting a malformed marker.
+		// Caller will get a marker that asks for a new cache/listing.
+		return fmt.Sprintf("%s[minio_cache:%s,return:]", marker, markerTagVersion)
 	}
-	return fmt.Sprintf("%s[minio_cache:%s,id:%s,p:%d,s:%d]", marker, markerTagVersion, o.ID, o.pool, o.set)
+
+	return fmt.Sprintf(
+		"%s[minio_cache:%s,id:%s,p:%d,s:%d]",
+		marker,
+		markerTagVersion,
+		o.ID,
+		o.pool,
+		o.set,
+	)
 }
