@@ -19,6 +19,7 @@ package cmd
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"reflect"
@@ -424,4 +425,106 @@ func Test_metacacheReader_skip(t *testing.T) {
 	if err != io.EOF {
 		t.Fatal(err)
 	}
+}
+
+func TestNewMetacacheBlockWriterUnbufferedChannelDoesNotEmitEmptyBlock(t *testing.T) {
+	in := make(chan metaCacheEntry) // cap == 0
+
+	var got []metacacheBlock
+
+	w := newMetacacheBlockWriter(in, func(b *metacacheBlock) error {
+		got = append(got, cloneMetacacheBlock(b))
+		return nil
+	})
+
+	in <- metaCacheEntry{name: "alpha"}
+	close(in)
+
+	w.wg.Wait()
+
+	if w.streamErr != nil {
+		t.Fatalf("unexpected stream error: %v", w.streamErr)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 block, got %d: %+v", len(got), summarizeBlocks(got))
+	}
+
+	if got[0].First != "alpha" {
+		t.Fatalf("expected First alpha, got %q", got[0].First)
+	}
+
+	if got[0].Last != "alpha" {
+		t.Fatalf("expected Last alpha, got %q", got[0].Last)
+	}
+
+	if !got[0].EOS {
+		t.Fatalf("expected single block to be EOS")
+	}
+
+	if len(got[0].data) == 0 {
+		t.Fatalf("expected block data to contain serialized entry, got empty data")
+	}
+}
+
+func TestNewMetacacheBlockWriterBufferedChannelCapacityTwoKeepsTwoEntriesInOneBlock(t *testing.T) {
+	in := make(chan metaCacheEntry, 2)
+
+	var got []metacacheBlock
+
+	w := newMetacacheBlockWriter(in, func(b *metacacheBlock) error {
+		got = append(got, cloneMetacacheBlock(b))
+		return nil
+	})
+
+	in <- metaCacheEntry{name: "alpha"}
+	in <- metaCacheEntry{name: "beta"}
+	close(in)
+
+	w.wg.Wait()
+
+	if w.streamErr != nil {
+		t.Fatalf("unexpected stream error: %v", w.streamErr)
+	}
+
+	if len(got) != 1 {
+		t.Fatalf("expected exactly 1 block for 2 entries with cap 2, got %d: %+v", len(got), summarizeBlocks(got))
+	}
+
+	if got[0].First != "alpha" {
+		t.Fatalf("expected First alpha, got %q", got[0].First)
+	}
+
+	if got[0].Last != "beta" {
+		t.Fatalf("expected Last beta, got %q", got[0].Last)
+	}
+
+	if !got[0].EOS {
+		t.Fatalf("expected the only block to be EOS")
+	}
+
+	if len(got[0].data) == 0 {
+		t.Fatalf("expected block data to contain serialized entries, got empty data")
+	}
+}
+
+func cloneMetacacheBlock(b *metacacheBlock) metacacheBlock {
+	c := *b
+	c.data = append([]byte(nil), b.data...)
+	return c
+}
+
+func summarizeBlocks(blocks []metacacheBlock) []string {
+	out := make([]string, 0, len(blocks))
+	for _, b := range blocks {
+		out = append(out, fmt.Sprintf(
+			"{First:%q Last:%q EOS:%v n:%d dataLen:%d}",
+			b.First,
+			b.Last,
+			b.EOS,
+			b.n,
+			len(b.data),
+		))
+	}
+	return out
 }
