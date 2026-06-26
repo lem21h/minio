@@ -96,6 +96,14 @@ func (b *bucketMetacache) findCache(o listPathOptions) metacache {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
+	if b.caches == nil {
+		b.caches = make(map[string]metacache)
+	}
+
+	if b.cachesRoot == nil {
+		b.cachesRoot = make(map[string][]string)
+	}
+
 	// Check if exists already.
 	if c, ok := b.caches[o.ID]; ok {
 		c.lastHandout = time.Now()
@@ -157,16 +165,16 @@ func (b *bucketMetacache) cleanup() {
 			}
 			remainCaches = append(remainCaches, cache)
 		}
-		if len(remainCaches) > metacacheMaxEntries {
-			// Sort oldest last...
-			sort.Slice(remainCaches, func(i, j int) bool {
-				return remainCaches[i].lastHandout.Before(remainCaches[j].lastHandout)
-			})
-			// Keep first metacacheMaxEntries...
-			for _, cache := range remainCaches[metacacheMaxEntries:] {
-				if time.Since(cache.lastHandout) > metacacheMaxClientWait {
-					remove[cache.id] = struct{}{}
-				}
+
+		// Sort oldest last...
+		sort.Slice(remainCaches, func(i, j int) bool {
+			return remainCaches[i].lastHandout.Before(remainCaches[j].lastHandout)
+		})
+		// Remove oldest entries above the limit.
+		excess := len(remainCaches) - metacacheMaxEntries
+		for _, cache := range remainCaches[:excess] {
+			if time.Since(cache.lastHandout) > metacacheMaxClientWait {
+				remove[cache.id] = struct{}{}
 			}
 		}
 	}
@@ -181,6 +189,9 @@ func (b *bucketMetacache) cleanup() {
 func (b *bucketMetacache) updateCacheEntry(update metacache) (metacache, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if b.caches == nil {
+		return update, errFileNotFound
+	}
 	existing, ok := b.caches[update.id]
 	if !ok {
 		return update, errFileNotFound
@@ -227,32 +238,46 @@ func (b *bucketMetacache) deleteAll() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 
-	b.updated = true
 	// Delete all.
 	ez.deleteAll(ctx, minioMetaBucket, metacachePrefixForID(b.bucket, slashSeparator))
+	b.updated = true
 	b.caches = make(map[string]metacache, 10)
 	b.cachesRoot = make(map[string][]string, 10)
+}
+
+// for test purposes
+var deleteMetacacheFiles = func(c metacache, ctx context.Context) {
+	c.delete(ctx)
 }
 
 // deleteCache will delete a specific cache and all files related to it across the cluster.
 func (b *bucketMetacache) deleteCache(id string) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	c, ok := b.caches[id]
-	if ok {
-		// Delete from root map.
-		list := b.cachesRoot[c.root]
-		for i, lid := range list {
-			if id == lid {
-				list = append(list[:i], list[i+1:]...)
-				break
-			}
+	if !ok {
+		return
+	}
+
+	// Delete from root map.
+	list := b.cachesRoot[c.root]
+	n := 0
+	for _, lid := range list {
+		if lid != id {
+			list[n] = lid
+			n++
 		}
+	}
+	list = list[:n]
+
+	if len(list) == 0 {
+		delete(b.cachesRoot, c.root)
+	} else {
 		b.cachesRoot[c.root] = list
-		delete(b.caches, id)
-		b.updated = true
 	}
-	b.mu.Unlock()
-	if ok {
-		c.delete(context.Background())
-	}
+
+	delete(b.caches, id)
+	b.updated = true
+
+	deleteMetacacheFiles(c, context.Background())
 }
