@@ -28,26 +28,62 @@ import (
 	"sync"
 	"time"
 
+	"github.com/minio/minio/internal/bucket/lifecycle"
 	"github.com/minio/minio/internal/grid"
 	xioutil "github.com/minio/minio/internal/ioutil"
 )
+
+var listMergedFn = func(
+	z *erasureServerPools,
+	ctx context.Context,
+	o listPathOptions,
+	filterCh chan<- metaCacheEntry,
+) error {
+	return z.listMerged(ctx, o, filterCh)
+}
 
 func renameAllBucketMetacache(epPath string) error {
 	// Rename all previous `.minio.sys/buckets/<bucketname>/.metacache` to
 	// to `.minio.sys/tmp/` for deletion.
 	return readDirFn(pathJoin(epPath, minioMetaBucket, bucketMetaPrefix), func(name string, typ os.FileMode) error {
-		if typ == os.ModeDir {
-			tmpMetacacheOld := pathutil.Join(epPath, minioMetaTmpDeletedBucket, mustGetUUID())
-			if err := renameAll(pathJoin(epPath, minioMetaBucket, metacachePrefixForID(name, slashSeparator)),
-				tmpMetacacheOld, epPath); err != nil && err != errFileNotFound {
-				return fmt.Errorf("unable to rename (%s -> %s) %w",
-					pathJoin(epPath, minioMetaBucket+metacachePrefixForID(minioMetaBucket, slashSeparator)),
-					tmpMetacacheOld,
-					osErrToFileErr(err))
-			}
+		if typ&os.ModeDir == 0 {
+			return nil
+		}
+		srcMetacacheOld := pathJoin(epPath, minioMetaBucket, metacachePrefixForID(name, slashSeparator))
+		tmpMetacacheOld := pathutil.Join(epPath, minioMetaTmpDeletedBucket, mustGetUUID())
+
+		if err := renameAll(srcMetacacheOld, tmpMetacacheOld, epPath); !errors.Is(err, errFileNotFound) {
+			return fmt.Errorf("unable to rename (%s -> %s) %w",
+				srcMetacacheOld,
+				tmpMetacacheOld,
+				osErrToFileErr(err),
+			)
 		}
 		return nil
 	})
+}
+
+var markMetacacheListingUnused = func(o listPathOptions) {
+	rpc := globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix))
+	if rpc == nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(GlobalContext, 5*time.Second)
+	defer cancel()
+
+	c, err := rpc.GetMetacacheListing(ctx, o)
+	if err == nil && c != nil {
+		c.error = "no longer used"
+		c.status = scanStateError
+		rpc.UpdateMetacacheListing(ctx, *c)
+	}
+}
+
+func markMetacacheListingUnusedAsyncAndClearID(o *listPathOptions) {
+	opts := *o
+	go markMetacacheListingUnused(opts)
+	o.ID = ""
 }
 
 // listPath will return the requested entries.
@@ -191,20 +227,7 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 			return entries, err
 		}
 		entries.truncate(0)
-		go func() {
-			rpc := globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix))
-			if rpc != nil {
-				ctx, cancel := context.WithTimeout(GlobalContext, 5*time.Second)
-				defer cancel()
-				c, err := rpc.GetMetacacheListing(ctx, *o)
-				if err == nil {
-					c.error = "no longer used"
-					c.status = scanStateError
-					rpc.UpdateMetacacheListing(ctx, *c)
-				}
-			}
-		}()
-		o.ID = ""
+		markMetacacheListingUnusedAsyncAndClearID(o)
 	}
 
 	if contextCanceled(ctx) {
@@ -228,7 +251,7 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 			// listing exactly at a specific limit.
 			o.StopDiskAtLimit = true
 		}
-		listErr = z.listMerged(listCtx, o, filterCh)
+		listErr = listMergedFn(z, listCtx, o, filterCh)
 		o.debugln("listMerged returned with", listErr)
 	}(*o)
 
@@ -254,6 +277,17 @@ func (z *erasureServerPools) listPath(ctx context.Context, o *listPathOptions) (
 	return entries, nil
 }
 
+var listPathOnSetFn = func(
+	set *erasureObjects,
+	ctx context.Context,
+	o listPathOptions,
+	results chan<- metaCacheEntry,
+) error {
+	return set.listPath(ctx, o, results)
+}
+
+var mergeEntryChannelsFn = mergeEntryChannels
+
 // listMerged will list across all sets and return a merged results stream.
 // The result channel is closed when no more results are expected.
 func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) error {
@@ -273,7 +307,7 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 			inputs = append(inputs, innerResults)
 			go func(i int, set *erasureObjects) {
 				defer wg.Done()
-				err := set.listPath(listCtx, o, innerResults)
+				err := listPathOnSetFn(set, listCtx, o, innerResults)
 				mu.Lock()
 				defer mu.Unlock()
 				if err == nil {
@@ -288,21 +322,21 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 
 	// Gather results to a single channel.
 	// Quorum is one since we are merging across sets.
-	err := mergeEntryChannels(ctx, inputs, results, 1)
+	err := mergeEntryChannelsFn(ctx, inputs, results, 1)
 
 	cancelList()
 	wg.Wait()
 
 	// we should return 'errs' from per disk
+	if err != nil {
+		return err
+	}
+
 	if isAllNotFound(errs) {
 		if isAllVolumeNotFound(errs) {
 			return errVolumeNotFound
 		}
 		return nil
-	}
-
-	if err != nil {
-		return err
 	}
 
 	if contextCanceled(ctx) {
@@ -326,6 +360,26 @@ func (z *erasureServerPools) listMerged(ctx context.Context, o listPathOptions, 
 	return nil
 }
 
+var metaCacheEntryFileInfoFn = func(obj metaCacheEntry, bucket string) (FileInfo, error) {
+	return obj.fileInfo(bucket)
+}
+
+var metaCacheEntryFileInfoVersionsFn = func(obj metaCacheEntry, bucket string) (FileInfoVersions, error) {
+	return obj.fileInfoVersions(bucket)
+}
+
+var evalLifecycleForListObjectFn = func(ctx context.Context, o listPathOptions, objInfo ObjectInfo) lifecycle.Event {
+	return evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, o.Replication.Config, objInfo)
+}
+
+var enqueueExpiryByDaysFn = func(objInfo ObjectInfo, evt lifecycle.Event, src lcEventSrc) {
+	globalExpiryState.enqueueByDays(objInfo, evt, src)
+}
+
+var queueReplicationHealFn = func(ctx context.Context, o listPathOptions, objInfo ObjectInfo) {
+	queueReplicationHeal(ctx, o.Bucket, objInfo, o.Replication, 0)
+}
+
 // triggerExpiryAndRepl applies lifecycle and replication actions on the listing
 // It returns true if the listing is non-versioned and the given object is expired.
 func triggerExpiryAndRepl(ctx context.Context, o listPathOptions, obj metaCacheEntry) (skip bool) {
@@ -336,19 +390,19 @@ func triggerExpiryAndRepl(ctx context.Context, o listPathOptions, obj metaCacheE
 	// filter out between versions 'obj' cannot be truncated
 	// in such a manner, so look for skipping an object only
 	// for regular ListObjects() call only.
-	if !o.Versioned && !o.V1 {
-		fi, err := obj.fileInfo(o.Bucket)
+	if !o.Versioned {
+		fi, err := metaCacheEntryFileInfoFn(obj, o.Bucket)
 		if err != nil {
 			return skip
 		}
 		objInfo := fi.ToObjectInfo(o.Bucket, obj.name, versioned)
 		if o.Lifecycle != nil {
-			act := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, o.Replication.Config, objInfo).Action
+			act := evalLifecycleForListObjectFn(ctx, o, objInfo).Action
 			skip = act.Delete() && !act.DeleteRestored()
 		}
 	}
 
-	fiv, err := obj.fileInfoVersions(o.Bucket)
+	fiv, err := metaCacheEntryFileInfoVersionsFn(obj, o.Bucket)
 	if err != nil {
 		return skip
 	}
@@ -358,23 +412,94 @@ func triggerExpiryAndRepl(ctx context.Context, o listPathOptions, obj metaCacheE
 		objInfo := version.ToObjectInfo(o.Bucket, obj.name, versioned)
 
 		if o.Lifecycle != nil {
-			evt := evalActionFromLifecycle(ctx, *o.Lifecycle, o.Retention, o.Replication.Config, objInfo)
+			evt := evalLifecycleForListObjectFn(ctx, o, objInfo)
 			if evt.Action.Delete() {
-				globalExpiryState.enqueueByDays(objInfo, evt, lcEventSrc_s3ListObjects)
+				enqueueExpiryByDaysFn(objInfo, evt, lcEventSrc_s3ListObjects)
 				if !evt.Action.DeleteRestored() {
 					continue
 				} // queue version for replication upon expired restored copies if needed.
 			}
 		}
 
-		queueReplicationHeal(ctx, o.Bucket, objInfo, o.Replication, 0)
+		queueReplicationHealFn(ctx, o, objInfo)
 	}
 	return skip
 }
 
+// seams for tests
+var listAndSaveGetAvailablePoolIdxFn = func(z *erasureServerPools, ctx context.Context, bucket string, object string, size int64) int {
+	return z.getAvailablePoolIdx(ctx, bucket, object, size)
+}
+
+var listAndSaveGetHashedSetIndexFn = func(pool *erasureSets, id string) int {
+	return pool.getHashedSetIndex(id)
+}
+
+var listAndSaveSaveMetaCacheStreamFn = func(saver *erasureObjects, ctx context.Context, meta *metaCacheRPC, saveCh <-chan metaCacheEntry) error {
+	return saver.saveMetaCacheStream(ctx, meta, saveCh)
+}
+
+var listAndSaveListMergedFn = func(z *erasureServerPools, ctx context.Context, o listPathOptions, results chan<- metaCacheEntry) error {
+	return z.listMerged(ctx, o, results)
+}
+
+var listAndSaveRestClientFromHashFn = func(hash string) *peerRESTClient {
+	return globalNotificationSys.restClientFromHash(hash)
+}
+
+// helper
+func listAndSaveFanOut(
+	ctx context.Context,
+	listCtx context.Context,
+	o listPathOptions,
+	inCh <-chan metaCacheEntry,
+	outCh chan<- metaCacheEntry,
+	saveCh chan<- metaCacheEntry,
+	funcReturned *bool,
+	funcReturnedMu *sync.Mutex,
+) {
+	var returned bool
+
+	defer xioutil.SafeClose(saveCh)
+
+	for entry := range inCh {
+		if o.shouldSkip(ctx, entry) {
+			continue
+		}
+
+		if !returned {
+			funcReturnedMu.Lock()
+			returned = *funcReturned
+			funcReturnedMu.Unlock()
+
+			if returned {
+				xioutil.SafeClose(outCh)
+			} else {
+				select {
+				case outCh <- entry:
+				case <-listCtx.Done():
+					return
+				}
+			}
+		}
+
+		entry.reusable = returned
+
+		select {
+		case saveCh <- entry:
+		case <-listCtx.Done():
+			return
+		}
+	}
+
+	if !returned {
+		xioutil.SafeClose(outCh)
+	}
+}
+
 func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions) (entries metaCacheEntriesSorted, err error) {
 	// Use ID as the object name...
-	o.pool = z.getAvailablePoolIdx(ctx, minioMetaBucket, o.ID, 10<<20)
+	o.pool = listAndSaveGetAvailablePoolIdxFn(z, ctx, minioMetaBucket, o.ID, 10<<20)
 	if o.pool < 0 {
 		// No space or similar, don't persist the listing.
 		o.pool = 0
@@ -383,11 +508,13 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 		o.Transient = true
 		return entries, errDiskFull
 	}
-	o.set = z.serverPools[o.pool].getHashedSetIndex(o.ID)
+	o.set = listAndSaveGetHashedSetIndexFn(z.serverPools[o.pool], o.ID)
 	saver := z.serverPools[o.pool].sets[o.set]
 
-	// Disconnect from call above, but cancel on exit.
+	// Disconnect from request context so the metacache save can continue
+	// after this call has returned enough entries to the caller.
 	listCtx, cancel := context.WithCancel(GlobalContext)
+
 	saveCh := make(chan metaCacheEntry, metacacheBlockSize)
 	inCh := make(chan metaCacheEntry, metacacheBlockSize)
 	outCh := make(chan metaCacheEntry, o.Limit)
@@ -395,62 +522,72 @@ func (z *erasureServerPools) listAndSave(ctx context.Context, o *listPathOptions
 	filteredResults := o.gatherResults(ctx, outCh)
 
 	mc := o.newMetacache()
-	meta := metaCacheRPC{meta: &mc, cancel: cancel, rpc: globalNotificationSys.restClientFromHash(pathJoin(o.Bucket, o.Prefix)), o: *o}
+	meta := metaCacheRPC{
+		meta:   &mc,
+		cancel: cancel,
+		rpc:    listAndSaveRestClientFromHashFn(pathJoin(o.Bucket, o.Prefix)),
+		o:      *o,
+	}
 
 	// Save listing...
 	go func() {
-		if err := saver.saveMetaCacheStream(listCtx, &meta, saveCh); err != nil {
+		defer cancel()
+		if err := listAndSaveSaveMetaCacheStreamFn(saver, listCtx, &meta, saveCh); err != nil {
 			meta.setErr(err.Error())
 		}
-		cancel()
+	}()
+
+	saveDone := make(chan struct{})
+	go func() {
+		defer close(saveDone)
+		defer cancel()
+
+		if err := listAndSaveSaveMetaCacheStreamFn(saver, listCtx, &meta, saveCh); err != nil {
+			meta.setErr(err.Error())
+		}
 	}()
 
 	// Do listing...
+	listErrCh := make(chan error, 1)
+
 	go func(o listPathOptions) {
-		err := z.listMerged(listCtx, o, inCh)
+		err := listAndSaveListMergedFn(z, listCtx, o, inCh)
 		if err != nil {
 			meta.setErr(err.Error())
 		}
+
 		o.debugln("listAndSave: listing", o.ID, "finished with ", err)
+
+		listErrCh <- err
+		close(listErrCh)
 	}(*o)
 
 	// Keep track of when we return since we no longer have to send entries to output.
 	var funcReturned bool
 	var funcReturnedMu sync.Mutex
-	defer func() {
-		funcReturnedMu.Lock()
-		funcReturned = true
-		funcReturnedMu.Unlock()
-	}()
-	// Write listing to results and saver.
-	go func() {
-		var returned bool
-		for entry := range inCh {
-			if o.shouldSkip(ctx, entry) {
-				continue
-			}
-			if !returned {
-				funcReturnedMu.Lock()
-				returned = funcReturned
-				funcReturnedMu.Unlock()
-				outCh <- entry
-				if returned {
-					xioutil.SafeClose(outCh)
-				}
-			}
-			entry.reusable = returned
-			saveCh <- entry
-		}
-		if !returned {
-			xioutil.SafeClose(outCh)
-		}
-		xioutil.SafeClose(saveCh)
-	}()
+
+	go listAndSaveFanOut(
+		ctx, listCtx, *o,
+		inCh, outCh, saveCh,
+		&funcReturned, &funcReturnedMu,
+	)
 
 	entries, err = filteredResults()
-	if err == nil {
-		// Check if listing recorded an error.
-		err = meta.getErr()
+
+	funcReturnedMu.Lock()
+	funcReturned = true
+	funcReturnedMu.Unlock()
+
+	if errors.Is(err, io.EOF) {
+		if listErr := <-listErrCh; listErr != nil {
+			return entries, listErr
+		}
 	}
+	if metaErr := meta.getErr(); metaErr != nil {
+		if err == nil || errors.Is(err, io.EOF) {
+			err = metaErr
+		}
+	}
+
 	return entries, err
 }
