@@ -49,69 +49,88 @@ const metacacheMaxEntries = 5000
 func (m *metacacheManager) initManager() {
 	// Add a transient bucket.
 	// Start saver when object layer is ready.
-	go func() {
-		objAPI := newObjectLayerFn()
-		for objAPI == nil {
-			time.Sleep(time.Second)
-			objAPI = newObjectLayerFn()
+	m.init.Do(func() {
+		go m.cleanupLoop()
+	})
+}
+
+func (m *metacacheManager) cleanupLoop() {
+	for {
+		if objAPI := newObjectLayerFn(); objAPI != nil {
+			break
 		}
 
-		t := time.NewTicker(time.Minute)
-		defer t.Stop()
-
-		var exit bool
-		for !exit {
-			select {
-			case <-t.C:
-			case <-GlobalContext.Done():
-				exit = true
-			}
-			m.mu.RLock()
-			for _, v := range m.buckets {
-				if !exit {
-					v.cleanup()
-				}
-			}
-			m.mu.RUnlock()
-			m.mu.Lock()
-			for k, v := range m.trash {
-				if time.Since(v.lastUpdate) > metacacheMaxRunningAge {
-					v.delete(context.Background())
-					delete(m.trash, k)
-				}
-			}
-			m.mu.Unlock()
+		select {
+		case <-time.After(time.Second):
+		case <-GlobalContext.Done():
+			return
 		}
-	}()
+	}
+
+	t := time.NewTicker(time.Minute)
+	defer t.Stop()
+
+	var exit bool
+	for !exit {
+		select {
+		case <-t.C:
+		case <-GlobalContext.Done():
+			exit = true
+		}
+		m.mu.RLock()
+		for _, v := range m.buckets {
+			if !exit {
+				v.cleanup()
+			}
+		}
+		m.mu.RUnlock()
+		m.mu.Lock()
+		for k, v := range m.trash {
+			if time.Since(v.lastUpdate) > metacacheMaxRunningAge {
+				v.delete(context.Background())
+				delete(m.trash, k)
+			}
+		}
+		m.mu.Unlock()
+	}
 }
 
 // updateCacheEntry will update non-transient state.
 func (m *metacacheManager) updateCacheEntry(update metacache) (metacache, error) {
 	m.mu.RLock()
-	if meta, ok := m.trash[update.id]; ok {
-		m.mu.RUnlock()
+	meta, inTrash := m.trash[update.id]
+	b, hasBucket := m.buckets[update.bucket]
+	m.mu.RUnlock()
+
+	if inTrash {
 		return meta, nil
 	}
 
-	b, ok := m.buckets[update.bucket]
-	m.mu.RUnlock()
-	if ok {
-		return b.updateCacheEntry(update)
+	if !hasBucket || b == nil {
+		// We should have either a trashed cache entry or an existing bucket.
+		return metacache{}, errVolumeNotFound
 	}
 
-	// We should have either a trashed bucket or this
-	return metacache{}, errVolumeNotFound
+	//TODO: still allows a race condition where the bucket is removed/trash-added after the manager lock is released
+	return b.updateCacheEntry(update)
 }
 
 // getBucket will get a bucket metacache or load it from disk if needed.
 func (m *metacacheManager) getBucket(ctx context.Context, bucket string) *bucketMetacache {
 	m.init.Do(m.initManager)
 
+	select {
+	case <-ctx.Done():
+		return nil
+	default:
+	}
+
 	// Return a transient bucket for invalid or system buckets.
 	m.mu.RLock()
-	b, ok := m.buckets[bucket]
-	if ok {
-		m.mu.RUnlock()
+	b := m.buckets[bucket]
+	m.mu.RUnlock()
+
+	if b != nil {
 		if b.bucket != bucket {
 			logger.Info("getBucket: cached bucket %s does not match this bucket %s", b.bucket, bucket)
 			debug.PrintStack()
@@ -119,12 +138,12 @@ func (m *metacacheManager) getBucket(ctx context.Context, bucket string) *bucket
 		return b
 	}
 
-	m.mu.RUnlock()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	// See if someone else fetched it while we waited for the lock.
-	b, ok = m.buckets[bucket]
-	if ok {
+
+	// Check again in case another goroutine created it while we waited.
+	b = m.buckets[bucket]
+	if b != nil {
 		if b.bucket != bucket {
 			logger.Info("getBucket: newly cached bucket %s does not match this bucket %s", b.bucket, bucket)
 			debug.PrintStack()
@@ -135,6 +154,7 @@ func (m *metacacheManager) getBucket(ctx context.Context, bucket string) *bucket
 	// New bucket. If we fail return the transient bucket.
 	b = newBucketMetacache(bucket, true)
 	m.buckets[bucket] = b
+
 	return b
 }
 
@@ -150,31 +170,59 @@ func (m *metacacheManager) deleteBucketCache(bucket string) {
 	delete(m.buckets, bucket)
 	m.mu.Unlock()
 
-	// Since deletes may take some time we try to do it without
-	// holding lock to m all the time.
+	if b == nil {
+		return
+	}
+
+	now := time.Now()
+
+	var expired []metacache
+	trash := make(map[string]metacache)
+
+	// collect expired/trash entries under b.mu, release b.mu, then update m.trash and delete files outside bucket lock.
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	for k, v := range b.caches {
-		if time.Since(v.lastUpdate) > metacacheMaxRunningAge {
-			v.delete(context.Background())
+		if now.Sub(v.lastUpdate) > metacacheMaxRunningAge {
+			expired = append(expired, v)
 			continue
 		}
+
 		v.error = "Bucket deleted"
 		v.status = scanStateError
+		trash[k] = v
+	}
+	b.mu.Unlock()
+
+	if len(trash) > 0 {
 		m.mu.Lock()
-		m.trash[k] = v
+		for k, v := range trash {
+			m.trash[k] = v
+		}
 		m.mu.Unlock()
+	}
+
+	for _, v := range expired {
+		v.delete(context.Background())
 	}
 }
 
 // deleteAll will delete all caches.
 func (m *metacacheManager) deleteAll() {
+	// manager should remove buckets under m.mu, then call b.deleteAll() after releasing m.mu
 	m.init.Do(m.initManager)
+
 	m.mu.Lock()
-	defer m.mu.Unlock()
-	for bucket, b := range m.buckets {
+	buckets := make([]*bucketMetacache, 0, len(m.buckets))
+	for _, b := range m.buckets {
+		if b != nil {
+			buckets = append(buckets, b)
+		}
+	}
+	m.buckets = make(map[string]*bucketMetacache)
+	m.mu.Unlock()
+
+	for _, b := range buckets {
 		b.deleteAll()
-		delete(m.buckets, bucket)
 	}
 }
 
@@ -187,7 +235,15 @@ func (o listPathOptions) checkMetacacheState(ctx context.Context, rpc *peerRESTC
 	if err != nil {
 		return err
 	}
+	if c == nil {
+		return errFileNotFound
+	}
+
 	cache := *c
+
+	if cache.fileNotFound || cache.status == scanStateNone {
+		return errFileNotFound
+	}
 
 	if cache.status == scanStateNone || cache.fileNotFound {
 		return errFileNotFound
