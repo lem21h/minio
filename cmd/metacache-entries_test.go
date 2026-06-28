@@ -18,8 +18,11 @@
 package cmd
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
+	"os"
 	"reflect"
 	"sort"
 	"testing"
@@ -124,7 +127,6 @@ func Test_metaCacheEntries_filterRecursive(t *testing.T) {
 	data.filterRecursiveEntries("src/compress/bzip2/", slashSeparator)
 	got := data.entries().names()
 	want := []string{"src/compress/bzip2/", "src/compress/bzip2/bit_reader.go", "src/compress/bzip2/bzip2.go", "src/compress/bzip2/bzip2_test.go", "src/compress/bzip2/huffman.go", "src/compress/bzip2/move_to_front.go"}
-	//               "src/compress/bzip2/", "src/compress/bzip2/bit_reader.go", "src/compress/bzip2/bzip2.go", "src/compress/bzip2/bzip2_test.go", "src/compress/bzip2/huffman.go", "src/compress/bzip2/move_to_front.go", "src/compress/bzip2/testdata/"
 	if !reflect.DeepEqual(want, got) {
 		t.Errorf("got unexpected result: %#v", got)
 	}
@@ -657,4 +659,526 @@ func Test_metaCacheEntries_resolve(t *testing.T) {
 			})
 		}
 	}
+}
+
+func testDir(name string) metaCacheEntry {
+	return metaCacheEntry{name: name}
+}
+
+func testObject(name string, metadata ...byte) metaCacheEntry {
+	if len(metadata) == 0 {
+		metadata = []byte{1}
+	}
+	return metaCacheEntry{name: name, metadata: metadata}
+}
+
+func testNames(entries metaCacheEntries) []string {
+	out := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		out = append(out, entry.name)
+	}
+	return out
+}
+
+func requireNames(t *testing.T, got metaCacheEntries, want []string) {
+	t.Helper()
+	gotNames := testNames(got)
+	if len(gotNames) == 0 && len(want) == 0 {
+		return
+	}
+	if !reflect.DeepEqual(gotNames, want) {
+		t.Fatalf("names mismatch\n got: %v\nwant: %v", gotNames, want)
+	}
+}
+
+func testEntryChan(entries ...metaCacheEntry) chan metaCacheEntry {
+	ch := make(chan metaCacheEntry, len(entries))
+	for _, entry := range entries {
+		ch <- entry
+	}
+	close(ch)
+	return ch
+}
+
+func collectEntryNames(ch <-chan metaCacheEntry) []string {
+	var names []string
+	for entry := range ch {
+		names = append(names, entry.name)
+	}
+	return names
+}
+
+func TestMetaCacheEntryClassification(t *testing.T) {
+	tests := []struct {
+		name          string
+		entry         metaCacheEntry
+		wantDir       bool
+		wantObject    bool
+		wantObjectDir bool
+	}{
+		{
+			name:    "synthetic prefix directory",
+			entry:   testDir("photos" + slashSeparator),
+			wantDir: true,
+		},
+		{
+			name:       "regular object",
+			entry:      testObject("photos/image.jpg"),
+			wantObject: true,
+		},
+		{
+			name:          "object whose key ends with slash",
+			entry:         testObject("photos"+slashSeparator, 1),
+			wantObject:    true,
+			wantObjectDir: true,
+		},
+		{
+			name:  "empty entry",
+			entry: metaCacheEntry{},
+		},
+		{
+			name:  "name without metadata and without trailing slash",
+			entry: metaCacheEntry{name: "photos"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := tt.entry.isDir(); got != tt.wantDir {
+				t.Fatalf("isDir() = %v, want %v", got, tt.wantDir)
+			}
+			if got := tt.entry.isObject(); got != tt.wantObject {
+				t.Fatalf("isObject() = %v, want %v", got, tt.wantObject)
+			}
+			if got := tt.entry.isObjectDir(); got != tt.wantObjectDir {
+				t.Fatalf("isObjectDir() = %v, want %v", got, tt.wantObjectDir)
+			}
+		})
+	}
+}
+
+func TestMetaCacheEntryHasPrefix(t *testing.T) {
+	entry := metaCacheEntry{name: "photos/2026/image.jpg"}
+	for _, prefix := range []string{"", "photos", "photos/", "photos/2026/"} {
+		if !entry.hasPrefix(prefix) {
+			t.Fatalf("hasPrefix(%q) = false, want true", prefix)
+		}
+	}
+	for _, prefix := range []string{"video", "photoz", "/photos"} {
+		if entry.hasPrefix(prefix) {
+			t.Fatalf("hasPrefix(%q) = true, want false", prefix)
+		}
+	}
+}
+
+func TestMetaCacheEntryMatchesNilAndDirectories(t *testing.T) {
+	var nilEntry *metaCacheEntry
+	prefer, ok := nilEntry.matches(nil, true)
+	if prefer != nil || !ok {
+		t.Fatalf("nil vs nil: prefer=%v ok=%v, want nil,true", prefer, ok)
+	}
+
+	dir := testDir("a/")
+	prefer, ok = nilEntry.matches(&dir, true)
+	if prefer != &dir || ok {
+		t.Fatalf("nil vs dir: prefer=%p ok=%v, want dir,false", prefer, ok)
+	}
+
+	otherDir := testDir("a/")
+	prefer, ok = dir.matches(&otherDir, true)
+	if prefer != &dir || !ok {
+		t.Fatalf("same synthetic dirs: prefer=%p ok=%v, want receiver,true", prefer, ok)
+	}
+
+	object := testObject("a/")
+	prefer, ok = dir.matches(&object, true)
+	if prefer != &dir || ok {
+		t.Fatalf("dir vs object with same name: prefer=%p ok=%v, want dir,false", prefer, ok)
+	}
+
+	bDir := testDir("b/")
+	prefer, ok = bDir.matches(&dir, true)
+	if prefer != &dir || ok {
+		t.Fatalf("different names choose lexicographically first: prefer.name=%q ok=%v, want a/,false", prefer.name, ok)
+	}
+}
+
+func TestMetaCacheEntryIsInDir(t *testing.T) {
+	tests := []struct {
+		name      string
+		entryName string
+		dir       string
+		separator string
+		want      bool
+	}{
+		{"root regular object", "file.txt", "", "/", true},
+		{"root synthetic directory", "photos/", "", "/", true},
+		{"root recursive child", "photos/image.jpg", "", "/", false},
+		{"direct child object", "photos/image.jpg", "photos/", "/", true},
+		{"direct child prefix", "photos/2026/", "photos/", "/", true},
+		{"recursive grandchild", "photos/2026/image.jpg", "photos/", "/", false},
+		{"outside directory", "videos/image.jpg", "photos/", "/", false},
+		{"prefix collision does not match as direct child", "photos-old/image.jpg", "photos/", "/", false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			entry := metaCacheEntry{name: tt.entryName}
+			if got := entry.isInDir(tt.dir, tt.separator); got != tt.want {
+				t.Fatalf("isInDir(%q, %q) = %v, want %v", tt.dir, tt.separator, got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMetaCacheEntryDirectoryFileInfoAndXLMetaErrors(t *testing.T) {
+	dir := testDir("photos/")
+
+	fi, err := dir.fileInfo("bucket-a")
+	if err != nil {
+		t.Fatalf("fileInfo(dir) returned unexpected error: %v", err)
+	}
+	if fi.Volume != "bucket-a" || fi.Name != "photos/" || fi.Mode != uint32(os.ModeDir) {
+		t.Fatalf("unexpected directory FileInfo: %#v", fi)
+	}
+
+	fiv, err := dir.fileInfoVersions("bucket-a")
+	if err != nil {
+		t.Fatalf("fileInfoVersions(dir) returned unexpected error: %v", err)
+	}
+	if fiv.Volume != "bucket-a" || fiv.Name != "photos/" || len(fiv.Versions) != 1 || fiv.Versions[0].Mode != uint32(os.ModeDir) {
+		t.Fatalf("unexpected directory FileInfoVersions: %#v", fiv)
+	}
+
+	if _, err := dir.xlmeta(); !errors.Is(err, errFileNotFound) {
+		t.Fatalf("xlmeta(dir) error = %v, want errFileNotFound", err)
+	}
+
+	missingObject := metaCacheEntry{name: "not-a-dir"}
+	if _, err := missingObject.xlmeta(); !errors.Is(err, errFileNotFound) {
+		t.Fatalf("xlmeta(empty non-dir) error = %v, want errFileNotFound", err)
+	}
+}
+
+func TestMetaCacheEntriesSortIsSortedNamesFirstFoundAndClone(t *testing.T) {
+	entries := metaCacheEntries{
+		testObject("c.txt", 3),
+		testDir("a/"),
+		testObject("b.txt", 2),
+	}
+	if entries.isSorted() {
+		t.Fatal("isSorted() = true for unsorted input, want false")
+	}
+
+	sorted := entries.sort()
+	if !sorted.o.isSorted() {
+		t.Fatal("sort() did not return sorted entries")
+	}
+	requireNames(t, sorted.entries(), []string{"a/", "b.txt", "c.txt"})
+	if !reflect.DeepEqual(sorted.o.names(), []string{"a/", "b.txt", "c.txt"}) {
+		t.Fatalf("names() = %v", sorted.o.names())
+	}
+
+	first, n := metaCacheEntries{{}, testDir("first/"), testObject("second.txt")}.firstFound()
+	if n != 2 || first == nil || first.name != "first/" {
+		t.Fatalf("firstFound() = (%v,%d), want first/,2", first, n)
+	}
+
+	metadata := []byte{1, 2, 3}
+	original := metaCacheEntries{testObject("a.txt", metadata...)}
+	clone := original.shallowClone()
+	clone[0].name = "changed.txt"
+	if original[0].name != "a.txt" {
+		t.Fatalf("shallowClone changed original entry name: %q", original[0].name)
+	}
+	clone[0].metadata[0] = 9
+	if original[0].metadata[0] != 9 {
+		t.Fatalf("shallowClone unexpectedly deep-copied metadata")
+	}
+}
+
+func TestMetaCacheEntriesResolveDirectories(t *testing.T) {
+	tests := []struct {
+		name     string
+		entries  metaCacheEntries
+		params   *metadataResolutionParams
+		wantOK   bool
+		wantName string
+	}{
+		{
+			name:    "nil params",
+			entries: metaCacheEntries{testDir("photos/")},
+			params:  nil,
+		},
+		{
+			name:   "empty entries",
+			params: &metadataResolutionParams{dirQuorum: 1, objQuorum: 1},
+		},
+		{
+			name:     "directory reaches quorum",
+			entries:  metaCacheEntries{testDir("photos/"), {}, testDir("photos/")},
+			params:   &metadataResolutionParams{dirQuorum: 2, objQuorum: 2},
+			wantOK:   true,
+			wantName: "photos/",
+		},
+		{
+			name:    "directory does not reach quorum",
+			entries: metaCacheEntries{testDir("photos/"), {}, metaCacheEntry{name: "missing"}},
+			params:  &metadataResolutionParams{dirQuorum: 2, objQuorum: 2},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			selected, ok := tt.entries.resolve(tt.params)
+			if ok != tt.wantOK {
+				t.Fatalf("resolve() ok = %v, want %v; selected=%#v", ok, tt.wantOK, selected)
+			}
+			if tt.wantOK && (selected == nil || selected.name != tt.wantName) {
+				t.Fatalf("resolve() selected = %#v, want name %q", selected, tt.wantName)
+			}
+		})
+	}
+}
+
+func TestMetaCacheEntriesSortedCloneLenEntriesAndTruncate(t *testing.T) {
+	var nilSorted *metaCacheEntriesSorted
+	nilSorted.truncate(1)
+	if nilSorted.len() != 0 {
+		t.Fatalf("nil len() = %d, want 0", nilSorted.len())
+	}
+	if nilSorted.entries() != nil {
+		t.Fatalf("nil entries() = %#v, want nil", nilSorted.entries())
+	}
+
+	metadata := []byte{1, 2}
+	m := metaCacheEntriesSorted{
+		o:                metaCacheEntries{testObject("a.txt", metadata...), testObject("b.txt", 2), testDir("c/")},
+		listID:           "list-1",
+		reuse:            false,
+		lastSkippedEntry: "skipped",
+	}
+	clone := m.shallowClone()
+	if clone.listID != m.listID || clone.reuse != m.reuse || clone.lastSkippedEntry != m.lastSkippedEntry {
+		t.Fatalf("shallowClone did not preserve metadata fields: %#v", clone)
+	}
+	clone.o[0].name = "changed.txt"
+	if m.o[0].name != "a.txt" {
+		t.Fatalf("sorted shallowClone changed original entry name: %q", m.o[0].name)
+	}
+	clone.o[0].metadata[0] = 9
+	if m.o[0].metadata[0] != 9 {
+		t.Fatalf("sorted shallowClone unexpectedly deep-copied metadata")
+	}
+
+	m.truncate(2)
+	requireNames(t, m.entries(), []string{"a.txt", "b.txt"})
+	m.truncate(10)
+	requireNames(t, m.entries(), []string{"a.txt", "b.txt"})
+}
+
+func TestMetaCacheEntriesSortedForwardToAndPast(t *testing.T) {
+	base := func() metaCacheEntriesSorted {
+		return metaCacheEntriesSorted{o: metaCacheEntries{
+			testObject("a.txt"),
+			testObject("b.txt"),
+			testObject("c.txt"),
+			testObject("d.txt"),
+		}}
+	}
+
+	t.Run("forwardTo keeps requested name and later entries", func(t *testing.T) {
+		m := base()
+		m.forwardTo("b.txt")
+		requireNames(t, m.entries(), []string{"b.txt", "c.txt", "d.txt"})
+	})
+
+	t.Run("forwardTo starts at first greater name", func(t *testing.T) {
+		m := base()
+		m.forwardTo("bb")
+		requireNames(t, m.entries(), []string{"c.txt", "d.txt"})
+	})
+
+	t.Run("forwardTo empty marker leaves list unchanged", func(t *testing.T) {
+		m := base()
+		m.forwardTo("")
+		requireNames(t, m.entries(), []string{"a.txt", "b.txt", "c.txt", "d.txt"})
+	})
+
+	t.Run("forwardPast skips requested name", func(t *testing.T) {
+		m := base()
+		m.forwardPast("b.txt")
+		requireNames(t, m.entries(), []string{"c.txt", "d.txt"})
+	})
+
+	t.Run("forwardPast beyond last empties list", func(t *testing.T) {
+		m := base()
+		m.forwardPast("z")
+		requireNames(t, m.entries(), nil)
+	})
+}
+
+func TestMetaCacheEntriesSortedFilters(t *testing.T) {
+	t.Run("filterPrefix keeps only entries with prefix", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{
+			testObject("a.txt"),
+			testObject("photos/1.jpg"),
+			testDir("photos/album/"),
+			testObject("photos2/1.jpg"),
+			testObject("z.txt"),
+		}}
+		m.filterPrefix("photos/")
+		requireNames(t, m.entries(), []string{"photos/1.jpg", "photos/album/"})
+	})
+
+	t.Run("filterPrefix empty leaves entries unchanged", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{testObject("a.txt"), testDir("b/")}}
+		m.filterPrefix("")
+		requireNames(t, m.entries(), []string{"a.txt", "b/"})
+	})
+
+	t.Run("filterObjectsOnly removes synthetic dirs but keeps slash-suffixed objects", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{
+			testDir("a/"),
+			testObject("b.txt"),
+			testObject("c/"),
+		}}
+		m.filterObjectsOnly()
+		requireNames(t, m.entries(), []string{"b.txt", "c/"})
+	})
+
+	t.Run("filterPrefixesOnly keeps only synthetic dirs", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{
+			testDir("a/"),
+			testObject("b.txt"),
+			testObject("c/"),
+		}}
+		m.filterPrefixesOnly()
+		requireNames(t, m.entries(), []string{"a/"})
+	})
+
+	t.Run("filterRecursiveEntries root keeps entries without separator", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{
+			testObject("a.txt"),
+			testDir("photos/"),
+			testObject("photos/1.jpg"),
+			testObject("z.txt"),
+		}}
+		m.filterRecursiveEntries("", "/")
+		requireNames(t, m.entries(), []string{"a.txt", "z.txt"})
+	})
+
+	t.Run("filterRecursiveEntries prefix keeps only direct non-recursive children", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{
+			testObject("a.txt"),
+			testObject("photos/1.jpg"),
+			testDir("photos/album/"),
+			testObject("photos/album/2.jpg"),
+			testObject("videos/1.jpg"),
+		}}
+		m.filterRecursiveEntries("photos/", "/")
+		requireNames(t, m.entries(), []string{"photos/1.jpg"})
+	})
+}
+
+func TestMetaCacheEntriesSortedMerge(t *testing.T) {
+	t.Run("unlimited merge interleaves sorted inputs", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{testObject("a.txt", 1), testObject("c.txt", 3)}}
+		other := metaCacheEntriesSorted{o: metaCacheEntries{testObject("b.txt", 2), testObject("d.txt", 4)}}
+		m.merge(other, -1)
+		requireNames(t, m.entries(), []string{"a.txt", "b.txt", "c.txt", "d.txt"})
+	})
+
+	t.Run("positive limit truncates merged output", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{testObject("a.txt", 1), testObject("c.txt", 3)}}
+		other := metaCacheEntriesSorted{o: metaCacheEntries{testObject("b.txt", 2), testObject("d.txt", 4)}}
+		m.merge(other, 2)
+		requireNames(t, m.entries(), []string{"a.txt", "b.txt"})
+	})
+
+	t.Run("same name and same metadata deduplicates", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{testObject("a.txt", 1), testObject("b.txt", 2)}}
+		other := metaCacheEntriesSorted{o: metaCacheEntries{testObject("a.txt", 1), testObject("c.txt", 3)}}
+		m.merge(other, -1)
+		requireNames(t, m.entries(), []string{"a.txt", "b.txt", "c.txt"})
+	})
+
+	t.Run("same name and different metadata keeps receiver entry first per method contract", func(t *testing.T) {
+		m := metaCacheEntriesSorted{o: metaCacheEntries{testObject("same.txt", 1)}}
+		other := metaCacheEntriesSorted{o: metaCacheEntries{testObject("same.txt", 2)}}
+		m.merge(other, -1)
+
+		if len(m.o) != 2 {
+			t.Fatalf("merge() produced %d entries, want 2", len(m.o))
+		}
+		if !reflect.DeepEqual(m.o[0].metadata, []byte{1}) || !reflect.DeepEqual(m.o[1].metadata, []byte{2}) {
+			t.Fatalf("same-name different-metadata order = %v then %v; want receiver metadata first", m.o[0].metadata, m.o[1].metadata)
+		}
+	})
+}
+
+func TestMergeEntryChannels(t *testing.T) {
+	t.Run("no input channels closes output", func(t *testing.T) {
+		out := make(chan metaCacheEntry)
+		if err := mergeEntryChannels(context.Background(), nil, out, 1); err != nil {
+			t.Fatalf("mergeEntryChannels() error = %v, want nil", err)
+		}
+		if _, ok := <-out; ok {
+			t.Fatal("output channel still open, want closed")
+		}
+	})
+
+	t.Run("single channel forwards input order", func(t *testing.T) {
+		out := make(chan metaCacheEntry, 2)
+		err := mergeEntryChannels(context.Background(), []chan metaCacheEntry{
+			testEntryChan(testObject("b.txt"), testDir("a/")),
+		}, out, 1)
+		if err != nil {
+			t.Fatalf("mergeEntryChannels() error = %v, want nil", err)
+		}
+		if got, want := collectEntryNames(out), []string{"b.txt", "a/"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("output names = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("multiple channels merge sorted unique names", func(t *testing.T) {
+		out := make(chan metaCacheEntry, 4)
+		err := mergeEntryChannels(context.Background(), []chan metaCacheEntry{
+			testEntryChan(testObject("a.txt"), testObject("c.txt")),
+			testEntryChan(testObject("b.txt"), testObject("d.txt")),
+		}, out, 1)
+		if err != nil {
+			t.Fatalf("mergeEntryChannels() error = %v, want nil", err)
+		}
+		if got, want := collectEntryNames(out), []string{"a.txt", "b.txt", "c.txt", "d.txt"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("output names = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("object wins over synthetic directory with same clean path", func(t *testing.T) {
+		out := make(chan metaCacheEntry, 1)
+		err := mergeEntryChannels(context.Background(), []chan metaCacheEntry{
+			testEntryChan(testDir("a/")),
+			testEntryChan(testObject("a", 1)),
+		}, out, 1)
+		if err != nil {
+			t.Fatalf("mergeEntryChannels() error = %v, want nil", err)
+		}
+		if got, want := collectEntryNames(out), []string{"a"}; !reflect.DeepEqual(got, want) {
+			t.Fatalf("output names = %v, want %v", got, want)
+		}
+	})
+
+	t.Run("canceled context returns context error and closes output", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		out := make(chan metaCacheEntry)
+		err := mergeEntryChannels(ctx, []chan metaCacheEntry{make(chan metaCacheEntry)}, out, 1)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("mergeEntryChannels() error = %v, want context.Canceled", err)
+		}
+		if _, ok := <-out; ok {
+			t.Fatal("output channel still open after cancellation, want closed")
+		}
+	})
 }

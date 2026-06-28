@@ -49,50 +49,40 @@ const metacacheMaxEntries = 5000
 func (m *metacacheManager) initManager() {
 	// Add a transient bucket.
 	// Start saver when object layer is ready.
-	m.init.Do(func() {
-		go m.cleanupLoop()
-	})
-}
-
-func (m *metacacheManager) cleanupLoop() {
-	for {
-		if objAPI := newObjectLayerFn(); objAPI != nil {
-			break
+	go func() {
+		objAPI := newObjectLayerFn()
+		for objAPI == nil {
+			time.Sleep(time.Second)
+			objAPI = newObjectLayerFn()
 		}
 
-		select {
-		case <-time.After(time.Second):
-		case <-GlobalContext.Done():
-			return
-		}
-	}
+		t := time.NewTicker(time.Minute)
+		defer t.Stop()
 
-	t := time.NewTicker(time.Minute)
-	defer t.Stop()
-
-	var exit bool
-	for !exit {
-		select {
-		case <-t.C:
-		case <-GlobalContext.Done():
-			exit = true
-		}
-		m.mu.RLock()
-		for _, v := range m.buckets {
-			if !exit {
-				v.cleanup()
+		var exit bool
+		for !exit {
+			select {
+			case <-t.C:
+			case <-GlobalContext.Done():
+				exit = true
 			}
-		}
-		m.mu.RUnlock()
-		m.mu.Lock()
-		for k, v := range m.trash {
-			if time.Since(v.lastUpdate) > metacacheMaxRunningAge {
-				v.delete(context.Background())
-				delete(m.trash, k)
+			m.mu.RLock()
+			for _, v := range m.buckets {
+				if !exit {
+					v.cleanup()
+				}
 			}
+			m.mu.RUnlock()
+			m.mu.Lock()
+			for k, v := range m.trash {
+				if time.Since(v.lastUpdate) > metacacheMaxRunningAge {
+					v.delete(context.Background())
+					delete(m.trash, k)
+				}
+			}
+			m.mu.Unlock()
 		}
-		m.mu.Unlock()
-	}
+	}()
 }
 
 // updateCacheEntry will update non-transient state.
